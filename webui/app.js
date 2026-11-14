@@ -101,7 +101,9 @@ function renderSources(sources) {
     const row = element("div", "source-entry" + (source.archived ? " archived" : ""));
     row.appendChild(element("span", "source-ic", source.kind === "directory" ? "▣" : "▤"));
     const info = element("div", "source-meta");
-    info.appendChild(element("strong", null, source.path.split("/").pop() || source.path));
+    const sourceName = element("strong", null, source.path.split("/").pop() || source.path);
+    sourceName.title = source.path;
+    info.appendChild(sourceName);
     const badges = [source.location_kind === "network" ? "远程共享" : "本地 / 映射盘"];
     if (source.ui_visibility === "removed") badges.push("已从界面移除 · 历史保留");
     else if (source.ui_visibility === "hidden") badges.push("已隐藏");
@@ -110,12 +112,18 @@ function renderSources(sources) {
     else if (source.availability === "interrupted") badges.push("扫描中断");
     else if (source.availability === "unknown") badges.push("等待重新扫描");
     else if (!source.enabled) badges.push("已暂停");
-    info.appendChild(element("small", null, source.path));
+    const sourcePath = element("small", null, source.path);
+    sourcePath.title = source.path; // truncated long paths remain inspectable.
+    info.appendChild(sourcePath);
     info.appendChild(element("small", "source-badges", badges.join(" · ")));
     info.appendChild(element("small", "source-badges",
       "已索引 " + source.indexed_files + " 项（图片 " + source.images + " / 视频 " + source.videos +
       "）· API 已接收 " + source.api_accepted + " · 云端人工核验 " + source.cloud_verified));
     row.appendChild(info);
+    // Keep every action inside ONE grid cell. Previously they were siblings of
+    // the text column and a full-width <details>; flexbox compressed the path
+    // into a ~10px column, rendering Chinese and Latin text vertically.
+    const controls = element("div", "source-controls");
     const index = element("button", "btn soft", "查看索引");
     index.addEventListener("click", () => {
       $("job-source-filter").value = String(source.id);
@@ -126,19 +134,19 @@ function renderSources(sources) {
       refresh();
       $("index").scrollIntoView({behavior: "smooth", block: "start"});
     });
-    row.appendChild(index);
+    controls.appendChild(index);
     if (source.ui_visibility !== "visible") {
       const show = element("button", "btn soft", "显示");
       show.addEventListener("click", () =>
         action("/api/source/display", {id: source.id, mode: "visible"},
           "已恢复界面显示，历史索引及备份状态没有改变"));
-      row.appendChild(show);
+      controls.appendChild(show);
     } else if (source.archived) {
       const restore = element("button", "btn primary", "恢复历史");
       restore.addEventListener("click", () =>
         action("/api/source/restore", {id: source.id},
           "历史来源已恢复。旧文件备份记录仍然保留，不会重新登记已接受的内容。"));
-      row.appendChild(restore);
+      controls.appendChild(restore);
     } else {
       const checkbox = element("input");
       checkbox.type = "checkbox";
@@ -149,7 +157,7 @@ function renderSources(sources) {
           checkbox.checked ? "来源已恢复" : "来源已暂停，索引和记录保留"));
       const toggle = element("label", "switch");
       toggle.append(checkbox, element("span"));
-      row.appendChild(toggle);
+      controls.appendChild(toggle);
     }
     if (source.ui_visibility === "visible") {
       const hide = element("button", "btn soft", "隐藏");
@@ -159,7 +167,7 @@ function renderSources(sources) {
         action("/api/source/display", {id: source.id, mode: "hidden"},
           "索引已隐藏，数据库和备份历史完整保留");
       });
-      row.appendChild(hide);
+      controls.appendChild(hide);
       const remove = element("button", "btn warn", "删除显示");
       remove.title = "移除本页映射并停止来源监控；不删除数据库及照片";
       remove.addEventListener("click", () => {
@@ -169,8 +177,9 @@ function renderSources(sources) {
             "已从界面移除。SQLite 历史仍然保留，重新添加相同目录即可恢复");
         }
       });
-      row.appendChild(remove);
+      controls.appendChild(remove);
     }
+    row.appendChild(controls);
     const events = element("details", "source-event-details");
     const eventHeader = element("summary", null, "操作记录");
     events.appendChild(eventHeader);

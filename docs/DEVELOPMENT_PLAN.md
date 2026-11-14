@@ -215,6 +215,15 @@ bash google-unlimited.sh help
 - **2026-11-14 06:44 WebUI 真实服务验收**：只重启经 PID+本机端口确认属于 GoogleUnlimited 的 `8796` 服务；`http://127.0.0.1:8796` HTTP 200，首页检查到目录/文件两个 `<details>` 默认关闭、隐藏记录按钮和保留数量提示；`/api/status`、`/api/status?include_hidden=1`、`/api/jobs`、`/api/source/events?source_id=1` 返回有效数据。生产 SQLite 原始历史完全未变：来源 ID 1 `/Volumes/WIN10/photo` 仍显示为已归档（archived=1，enabled=0，ui_visibility=visible），媒体 586、目录 9，`queued=564`、`paused=22`，没有 Google API 成功/云端人工核验记录，监控/上传 OFF。**没有替用户自动点击隐藏/删除。**
 - **后续真实行为**：用户在 WebUI 手动点“隐藏”或“删除显示”，正常页面就不显示该来源/对应明细，按钮“显示隐藏记录”仍可检查并恢复；再重新添加同一挂载路径即复用旧数据库索引和任务状态，不自动重新 hash 整个目录。已补充浏览器端清理：即使在操作前用户展开过该来源的目录或文件列表，也会立即关闭并清空当前页面的明细 DOM，避免残留显示隐藏来源的数据；SQLite 仍不变。
 
+### 9.7 来源卡片纵排 UI 回归修复（2026-11-14）
+
+- **用户截图证据**：来源卡片内 `/Volumes/WIN10/photo` 的路径与“已索引 586 项”等摘要被挤成逐字竖排，产生超高白色卡片。上版只进行了 API/单元验收、没有实际 CSS 布局验收，是疏漏。
+- **根因**：`.source-entry` 使用 `display:flex`，却把查看索引、恢复、隐藏、删除按钮与具有 `flex-basis:100%` 的操作记录 `details` 全部作为同级 flex 子元素。在容器宽度有限时，`.source-meta` 被压缩为几像素，导致 CJK 与英文字母按字逐行换行。
+- **修复**：`webui/app.js` 将全部操作按钮装入独立 `.source-controls` 容器，`webui/style.css` 将来源卡片改成 `42px minmax(0, 1fr) auto` 三列 CSS Grid，目录与状态摘要添加单行省略/最小宽度约束；操作记录置于单独 grid 行。视口小于 1110px 时按钮移到第二行；小于 540px 时按钮和操作记录横跨整卡，避免手机端压缩文字。
+- **真实环境与视觉验收边界**：Mac M2 Google Chrome 的 headless/CDP 截图因 macOS `CVDisplayLinkCreateWithCGDisplay failed` 无法启动；因此**不能宣称已经拿到 Mac M2 实际页面截图**。改用独立 Linux Chromium 渲染同结构/CSS 的来源卡片复现，检查 1440/900/390px 三种视口，三组截图均肉眼复核无竖排：来源卡高度 128/178/178px，文字列宽约 768/761/257px，标题高度均 16px。Chromium 复现图**不是实际 Mac 页面截图**。
+- **测试保护**：`tests/test_webui.py::test_source_card_layout_regression_guard` 检查按钮容器与 Grid 关键定义，不再只用 API 测试判断 UI 健康；Mac M2 本机 Python 21 项测试通过，JS/Python 语法及 `git diff --check` 通过。正式访问 `http://127.0.0.1:8796` 需采用浏览器强制刷新以排除旧 CSS 缓存；服务使用 `no-store`。
+- **数据安全**：本轮只修改前端 HTML/CSS/JS、无凭据测试和本文，不更改 `webui/state/` 的历史 SQLite；既有 586 个媒体任务及 9 个目录、Google 上传和 MI3MountMac 逻辑不受影响。
+
 ## 10. 之前阶段待办与交接
 
 

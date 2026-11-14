@@ -48,6 +48,20 @@ class WebUITest(unittest.TestCase):
         with self.assertRaises(UserError):
             self.store.set_upload(True)
 
+    def test_source_card_layout_regression_guard(self):
+        """Action buttons must never squeeze source metadata into a vertical sliver."""
+        base = Path(__file__).resolve().parents[1] / "webui"
+        js = (base / "app.js").read_text(encoding="utf-8")
+        css = (base / "style.css").read_text(encoding="utf-8")
+        self.assertIn('const controls = element("div", "source-controls")', js)
+        self.assertIn("row.appendChild(controls)", js)
+        self.assertIn("controls.appendChild(index)", js)
+        self.assertIn("controls.appendChild(remove)", js)
+        self.assertIn("grid-template-columns: 42px minmax(0, 1fr) auto", css)
+        self.assertIn(".source-entry > .source-meta", css)
+        self.assertIn("text-overflow: ellipsis", css)
+        self.assertIn("@media (max-width: 1110px)", css)
+
     def test_add_folder_and_detect_dedup(self):
         self.store.add_source(str(self.source), "directory")
         self.wait_for_jobs(2)
