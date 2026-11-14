@@ -224,6 +224,31 @@ bash google-unlimited.sh help
 - **测试保护**：`tests/test_webui.py::test_source_card_layout_regression_guard` 检查按钮容器与 Grid 关键定义，不再只用 API 测试判断 UI 健康；Mac M2 本机 Python 21 项测试通过，JS/Python 语法及 `git diff --check` 通过。正式访问 `http://127.0.0.1:8796` 需采用浏览器强制刷新以排除旧 CSS 缓存；服务使用 `no-store`。
 - **数据安全**：本轮只修改前端 HTML/CSS/JS、无凭据测试和本文，不更改 `webui/state/` 的历史 SQLite；既有 586 个媒体任务及 9 个目录、Google 上传和 MI3MountMac 逻辑不受影响。
 
+### 9.8 Google Photos 相册参数和独立账号首次试传（2026-11-14）
+
+> NexusDock 任务 `tsk_7acc76dcc45f3140`；限定在 mac-M2、项目 `/Users/samni/Desktop/开发项目/GoogleUnlimited`，沿用唯一 docs 和 SQLite，不迁移小米 3/MI3MountMac 业务。
+
+**第一手 CLI 验证**：本机 `gotohp-cli-macos-universal upload --help` 对 v0.11.0 明确列出 `-a, --album string add uploads to album (creates if needed); 'AUTO' creates albums from folder names`，同时支持 `--saver`。因此按**固定相册名**上传是上游已有的能力，不必自行反向实现 Google Photos Album API。应用对每个文件调用 `gotohp-cli ... upload --no-tui --saver --album <已确认名称> <文件路径>`。该参数语义只根据 gotohp 命令帮助验证；真正的云端相册归属尚需有凭据后检查。
+
+**WebUI / SQLite 设计与防误上传**：
+
+- `sources.album_name`、`album_confirmed`、`album_confirmed_at` 持久化为每个来源的固定相册名、明确确认标记和确认时间。历史来源的缺省建议为文件夹最后一层名字，**确认标志初始为 0**；`set_album` 严格校验长度和控制字符，上传开关打开或该来源存在上传中任务时禁止改名；更改/确认事件写入 `source_events`。
+- 来源卡片增加默认收起的“相册名称与单张试传”。展开可编辑名称，点击“保存并确认相册”后才可能上传；不变的历史上传状态不被清零。重挂载同一路径按原 `source_id` 复用原来的相册确认和媒体任务。
+- 后台 `_next_job` 筛选仅允许 `enabled=1,archived=0,availability=online,album_confirmed=1` 的来源。即便有人打开全局上传开关，未确认来源绝不自动上传。单张试传需用户在 WebUI 再次主动确认，确保本机独立凭据存在、CLI 哈希与路径验签成功、进程以 `--allow-real-upload` 启动且全局批量上传仍为 OFF；只挑本来源最小的可用未上传照片，上传 1 次，不会执行 217 张/视频的批次。
+- 提交上传后的 `api_accepted` 只是 gotohp/Google 非官方 API 的接受证据，不等于相册在 Google 官方界面实际存在或云端配额零增长。每次真实测试都应去 Google Photos 网页查看目标相册里的测试媒体、所属账号和存储使用量。更改相册名不会自动搬移以前上传的文件；SQLite 的全局内容去重也未确保所有重复文件自动关联到不同相册，这部分属于后续专项改造，不可冒称已完成。
+- 本项目`webui/state/gotohp.config` 不与 MI3MountMac/小米 3 共用账号。Cookie/Token **不得经过 NexusDock 远程工具、聊天、WebUI、GitHub 提交或公开服务器**。
+
+**Chrome Profile 8pndk8ba 安全手动授权步骤**（对应 README 新章节）：
+
+1. 用户本人切换 Mac Chrome `8pndk8ba`，在该 Chrome 里打开 `https://accounts.google.com/EmbeddedSetup`，核对是本轮**另一测试 Google 账号**并完成同意。
+2. Chrome DevTools → Application → Cookies → `https://accounts.google.com`，**仅复制 Embedded Setup 产生的单个 `oauth_token` 的 Value**；不导出整个 Google 账号 Cookie 数据库，不复制主 Token；该 Cookie 可能短期有效，马上使用。
+3. 在物理 Mac M2 的 Terminal **本人运行** `cd "/Users/samni/Desktop/开发项目/GoogleUnlimited" && bash scripts/authorize_local.sh`。脚本检查 TTY，用不可见提示接收临时 token，并通过 STDIN 调用独立 gotohp `creds add -`；持久凭据只写项目 Git 忽略的 `webui/state/gotohp.config`，权限 0600，不会把凭据放在 argv 或远程命令里。
+4. 用户本人可运行 `gotohp-cli-macos-universal --config ... creds list` 检查独立账号邮箱是否正确，然后以 `--allow-real-upload` 安全重启本项目服务（默认上传仍关闭）。先确认对应来源相册，再测试**一张图片**；完成官方网页的云端与配额核验之前，绝不整批开启。
+
+**指定来源**：WebUI 来源 ID 2，实际路径为 `/Volumes/WIN10/photo/2020@11月行程 南宁武汉贵州长白山 已nas`，在当前 SQLite 中已有 217 条 `queued` 记录，目录可访问。用户拟定云端相册名称为 **`2020@11月行程 南宁武汉贵州长白山`**（不带磁盘目录的“已nas”后缀）。本轮仅预填 SQLite 相册建议，保持 `album_confirmed=0`，等待用户本人在 WebUI 点击确认。项目独立 `gotohp.config` 此前不存在；因此无法执行真实 Google Photos 上传/配额核查，不能谎称已完成第一波云端上传。
+
+**本机实测（2026-11-14）**：Python 24 项测试全部通过（较前次新增 3 项相册相关测试；HTTP/API 验证也覆盖无凭据拒绝试传和确认保存），JS/Python/shell 语法及 `git diff --check` 通过。初始生产 DB 在更改相册设置前使用 SQLite `backup()` 备份到 `webui/state/queue.pre-album-20261114.sqlite3`，不提交 Git。只重启 Mac M2 上经进程名和端口核验的 GoogleUnlimited 8796 服务；现场 HTTP 200，上传/目录监控 OFF，`allow_real_upload=false`，独立凭据文件不存在。针对目标来源 ID 2 预填 `2020@11月行程 南宁武汉贵州长白山`、`album_confirmed=0`，原任务状态严格不变：来源 1 有 369 项 queued，来源 2 有 217 项 queued，合计 586 项；目录和照片均未删除。首个安全单图候选为来源 2 中约 3,763,142 字节的 JPG（仅核对存在和大小，不上传）。第一波“试传 1 张照片”目前**只完成模拟上传测试，真实试传受独立账号授权缺失阻断**；本地 Chrome Profile 登录不能自动替代 gotohp 认证。后续用户本人运行 `bash scripts/authorize_local.sh`，确认正确账号后再使用 WebUI 的相册确认与单张上传按钮。跨平台 GitHub CI 需以最新提交后的远端结果为准。
+
 ## 10. 之前阶段待办与交接
 
 

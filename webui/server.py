@@ -108,7 +108,10 @@ class Store:
                 mount_root TEXT NOT NULL DEFAULT '',
                 availability TEXT NOT NULL DEFAULT 'unknown',
                 last_checked_at TEXT NOT NULL DEFAULT '',
-                ui_visibility TEXT NOT NULL DEFAULT 'visible'
+                ui_visibility TEXT NOT NULL DEFAULT 'visible',
+                album_name TEXT NOT NULL DEFAULT '',
+                album_confirmed INTEGER NOT NULL DEFAULT 0,
+                album_confirmed_at TEXT NOT NULL DEFAULT ''
               );
               CREATE TABLE IF NOT EXISTS jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -168,6 +171,9 @@ class Store:
                 "availability": "TEXT NOT NULL DEFAULT 'unknown'",
                 "last_checked_at": "TEXT NOT NULL DEFAULT ''",
                 "ui_visibility": "TEXT NOT NULL DEFAULT 'visible'",
+                "album_name": "TEXT NOT NULL DEFAULT ''",
+                "album_confirmed": "INTEGER NOT NULL DEFAULT 0",
+                "album_confirmed_at": "TEXT NOT NULL DEFAULT ''",
             }
             job_cols = {
                 "mtime_ns": "INTEGER NOT NULL DEFAULT 0",
@@ -186,6 +192,11 @@ class Store:
                 for column, definition in columns.items():
                     if column not in existing:
                         con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            # Existing sources receive a suggested album name without authorizing
+            # any upload. Preserve a previously confirmed custom album name.
+            for row in con.execute("SELECT id,path,album_name FROM sources WHERE album_name=''"):
+                con.execute("UPDATE sources SET album_name=? WHERE id=?",
+                            (Path(row["path"]).name, row["id"]))
             # Migrate pre-WebUI-upgrade jobs in place. Never erase their status.
             older = con.execute("""SELECT id,name,updated_at FROM jobs
                                    WHERE media_kind='' OR first_seen_at=''""").fetchall()
@@ -386,6 +397,28 @@ class Store:
         con.execute("""INSERT INTO source_events(source_id,action,created_at,note)
                        VALUES(?,?,?,?)""", (source_id, action, now(), note))
 
+    def set_album(self, source_id, title):
+        """Set and explicitly confirm one album for this source; never auto-upload."""
+        if (not isinstance(title, str) or not 1 <= len(title.strip()) <= 120 or
+                title != title.strip() or any(ord(c) < 32 or ord(c) == 127 for c in title)):
+            raise UserError("相册名称必须为 1–120 个非控制字符，不能有首尾空格")
+        if self.upload_enabled:
+            raise UserError("请先关闭真实上传开关，然后再调整相册名称")
+        with self.connection() as con:
+            source = con.execute("SELECT id,album_name FROM sources WHERE id=?",
+                                 (int(source_id),)).fetchone()
+            if not source:
+                raise UserError("来源不存在")
+            if con.execute("""SELECT 1 FROM jobs WHERE source_id=? AND status='uploading'
+                              LIMIT 1""", (int(source_id),)).fetchone():
+                raise UserError("来源有进行中的上传，请在结束后修改相册")
+            con.execute("""UPDATE sources SET album_name=?,album_confirmed=1,
+                           album_confirmed_at=? WHERE id=?""",
+                        (title, now(), int(source_id)))
+            self._event(con, int(source_id), "album_confirmed",
+                        "用户确认相册名：" + title)
+        return self.sources()
+
     def set_display(self, source_id, mode):
         if mode not in ("visible", "hidden", "removed"):
             raise UserError("无效的显示操作")
@@ -503,6 +536,8 @@ class Store:
                         (path, kind, now(), "network" if matched else "local",
                          matched["path"] if matched else "", now()))
             source = con.execute("SELECT id FROM sources WHERE path=?", (path,)).fetchone()
+            con.execute("""UPDATE sources SET album_name=? WHERE id=? AND album_name=''""",
+                        (Path(path).name, source["id"]))
             self._event(con, source["id"],
                         "reload" if prior else "added",
                         "复用原索引与所有备份状态" if prior else "新增来源")
@@ -762,15 +797,18 @@ class Store:
                 and self.credentials.stat().st_mode & 0o077 == 0)
 
     def set_upload(self, enabled):
-        if enabled and not self._auth_ready():
-            raise UserError("真实上传未开放：需显式启用服务器上传权限，并在 WebUI 独立状态目录完成账号授权")
         if enabled:
-            if self.cli.resolve() != (ROOT / "gotohp-cli-macos-universal").resolve():
-                raise UserError("仅允许使用已确认的本机 gotohp 上传引擎路径")
-            if self._digest(self.cli) != PINNED_MAC_CLI_SHA256:
-                raise UserError("gotohp 官方发布文件 SHA-256 校验失败，拒绝上传")
+            self._ensure_upload_ready()
         self.upload_enabled = bool(enabled)
         self.wake_event.set()
+
+    def _ensure_upload_ready(self):
+        if not self._auth_ready():
+            raise UserError("真实上传未开放：请先在 Mac 本机完成独立账号授权，并用 --allow-real-upload 启动")
+        if self.cli.resolve() != (ROOT / "gotohp-cli-macos-universal").resolve():
+            raise UserError("仅允许使用已确认的本机 gotohp 上传引擎路径")
+        if self._digest(self.cli) != PINNED_MAC_CLI_SHA256:
+            raise UserError("gotohp 上传引擎 SHA-256 校验失败，拒绝上传")
 
     def retry(self, job_id):
         with self.connection() as con:
@@ -784,14 +822,23 @@ class Store:
                            updated_at=? WHERE id=?""", (now(), job_id))
         self.wake_event.set()
 
-    def _next_job(self):
+    def _next_job(self, *, source_id=None, image_only=False):
+        args = [time.time()]
+        condition = ""
+        if source_id is not None:
+            condition += " AND j.source_id=?"
+            args.append(int(source_id))
+        if image_only:
+            condition += " AND j.media_kind='image'"
+        ordering = "j.bytes ASC,j.id ASC" if image_only else "j.id ASC"
         with self.connection() as con:
             return con.execute("""SELECT j.* FROM jobs j
                  JOIN sources s ON s.id=j.source_id AND s.enabled=1
                  AND s.archived=0 AND s.availability='online'
+                 AND s.album_confirmed=1 AND s.album_name!=''
                  WHERE (j.status='queued' OR (j.status='retrying' AND j.retry_at<=?))
-                   AND j.file_available=1
-                 ORDER BY j.id ASC LIMIT 1""", (time.time(),)).fetchone()
+                   AND j.file_available=1 """ + condition +
+                 " ORDER BY " + ordering + " LIMIT 1", args).fetchone()
 
     def _run_upload(self, job):
         """Only called when explicit credentials, env gate and UI enable all hold."""
@@ -800,9 +847,16 @@ class Store:
             return False, "", "源文件消失或无效"
         if self._digest(path) != job["digest"]:
             return False, "", "源文件内容变化，请重新扫描"
+        with self.connection() as con:
+            source = con.execute("""SELECT album_name,album_confirmed,enabled,archived
+                                    FROM sources WHERE id=?""", (job["source_id"],)).fetchone()
+        if not source or not source["album_confirmed"] or not source["album_name"]:
+            return False, "", "来源相册尚未确认，禁止上传"
+        if not source["enabled"] or source["archived"]:
+            return False, "", "来源未启用，禁止上传"
         timeout = min(21600, max(600, job["bytes"] // 51200))
         cmd = [str(self.cli), "--config", str(self.credentials),
-               "upload", "--no-tui", "--saver", str(path)]
+               "upload", "--no-tui", "--saver", "--album", source["album_name"], str(path)]
         try:
             result = subprocess.run(cmd, capture_output=True, text=True,
                                     timeout=timeout, check=False)
@@ -819,10 +873,10 @@ class Store:
             return False, "", "缺少可核对的 mediaKey，未登记为成功"
         return True, key.group(1), ""
 
-    def run_one(self):
-        if not (self.upload_enabled and self._auth_ready()):
+    def run_one(self, *, source_id=None, image_only=False, manual=False):
+        if not ((manual or self.upload_enabled) and self._auth_ready()):
             return False
-        job = self._next_job()
+        job = self._next_job(source_id=source_id, image_only=image_only)
         if job is None:
             return False
         with self.connection() as con:
@@ -865,6 +919,31 @@ class Store:
                                WHERE id=?""", (status, attempts, retry_at, error, now(), job["id"]))
         self._rebuild_folder_index(job["source_id"])
         return True
+
+    def test_one_image(self, source_id):
+        """Explicit one-photo upload; the global bulk-upload switch remains OFF."""
+        if self.upload_enabled:
+            raise UserError("请先关闭批量上传开关，再测试单张图片")
+        self._ensure_upload_ready()
+        with self.connection() as con:
+            source = con.execute("""SELECT id,album_name,album_confirmed FROM sources
+                                    WHERE id=? AND enabled=1 AND archived=0""",
+                                 (int(source_id),)).fetchone()
+        if not source:
+            raise UserError("来源不存在或已经暂停")
+        if not source["album_confirmed"]:
+            raise UserError("请先确认相册名称，再进行单张测试")
+        job = self._next_job(source_id=source_id, image_only=True)
+        if not job:
+            raise UserError("没有可用的未上传照片可测试；请检查磁盘和队列状态")
+        # Single synchronous attempt only; never launches a 217-item batch.
+        self.run_one(source_id=source_id, image_only=True, manual=True)
+        with self.connection() as con:
+            done = con.execute("""SELECT id,status,error,name FROM jobs WHERE id=?""",
+                               (job["id"],)).fetchone()
+        return {"id": done["id"], "status": done["status"],
+                "name": done["name"], "error": done["error"],
+                "album": source["album_name"]}
 
     def _worker_loop(self):
         next_poll = 0
@@ -1005,6 +1084,11 @@ def make_handler(store):
                 elif uri == "/api/source/display":
                     result = {"sources": store.set_display(
                         int(payload["id"]), payload.get("mode"))}
+                elif uri == "/api/source/album":
+                    result = {"sources": store.set_album(
+                        int(payload["id"]), payload.get("album_name"))}
+                elif uri == "/api/source/test-upload":
+                    result = {"test": store.test_one_image(int(payload["id"]))}
                 elif uri == "/api/source/restore":
                     result = {"sources": store.restore_source(int(payload["id"]))}
                 elif uri == "/api/cloud/verify":

@@ -26,6 +26,34 @@ bash tests/test_offline_audit.sh
 bash tests/test_macos_binary_selection.sh
 ```
 
+### Mac M2 独立 Google 账号授权 + Google Photos 相册上传（安全流程）
+
+本项目使用 gotohp v0.11.0 的 **`upload --album "相册名称"`** 参数，将已上传的媒体放入指定 Google Photos 相册（必要时新建相册）。WebUI 为每个**来源目录**维护单独的 `album_name` 和 `album_confirmed`，默认建议使用源文件夹名字；你可以修改后点击“保存并确认相册”。在没有明确确认相册之前，该目录的任务**不会被自动上传**。每个来源的相册设置保留在 SQLite 中，隐藏、移除显示或重新挂载均不会丢失。改变相册名不会自动迁移已上传文件。
+
+**仅在 Mac M2 本机 Chrome 的指定配置文件中由用户本人执行 Google 登录：**
+
+1. 切换到目标 Google 账号所在的 Chrome Profile（例如你当前的 `8pndk8ba`；注意这是 Chrome 配置文件 ID，并非 Google Photos 凭据）。在 Chrome 打开 <https://accounts.google.com/EmbeddedSetup>，确认显示的是目标 Google 账号，完成同意。页面持续转圈可能正常。
+2. 在 **Chrome 开发者工具 → Application（应用）→ Cookies → `https://accounts.google.com`**，只找到这一登录流程产生的 `oauth_token` 的 **Value**，**不要导出完整 Cookie 数据库、所有 Cookies、Google 密码或主令牌**。它是高敏感、通常短时有效的认证凭据；只在本机使用，不要贴进聊天或送到 NexusDock/server/GitHub。
+3. 在 **Mac M2 本机 Terminal** 执行（不要通过远程 Agent 提交带有 token 的命令）：
+
+       cd "/Users/samni/Desktop/开发项目/GoogleUnlimited"
+       bash scripts/authorize_local.sh
+
+   在终端的隐藏输入提示中粘贴刚才的单个 `oauth_token`，按 Return。脚本通过 STDIN 调用本机 `gotohp-cli --config webui/state/gotohp.config creds add -`；令牌不出现在进程命令行、Shell history、WebUI 或日志中。持久凭据只保存在本机忽略 Git 的 `webui/state/gotohp.config`（权限 `0600`、目录 `0700`）。后续仅查看账户名可执行：
+
+       ./gotohp-cli-macos-universal --config "$(pwd)/webui/state/gotohp.config" creds list
+
+   如果未看到目标账号或授权失败，不要启动上传。**网页登录本身不足以授权 gotohp**。
+4. 确认独立账号无误后，以本地启动参数显式开放上传开关（WebUI 在重启后默认仍是上传 OFF）：
+
+       python3 webui/server.py --port 8796 --allow-real-upload
+
+   如果旧服务正在运行，须先安全退出项目自己的服务进程；不要直接启动第二个同端口实例，也不要停止其他服务。
+5. 在 `http://127.0.0.1:8796`，展开对应来源的“**相册名称与单张试传**”，核对/编辑相册名，再点“**保存并确认相册**”。首次验证请先点击“**仅试传 1 张照片**”，它只选择该目录最小的一张尚未上传的图片；不会自动启用整批上传。
+6. 前往 **Google Photos 官方页面**检查对应账号、相册名称、测试图像是否出现，以及存储使用量的前后变化，并记录结果。只有核对无误才考虑启动 WebUI 的全局批量上传。**CLI `--saver` 和客户端不使用配额参数不保证 Google 服务端免费/无限计费，也不等于云端人工核验。**
+
+**上传警告：** GoogleUnlimited/gotohp 是依赖非公开 Google Photos 接口的第三方项目，Google 可能拒绝授权或改变接口；未经云端验证不能称为完成备份。跨目录同 SHA-256 内容去重仍使用原有 SQLite 逻辑；文件在其他来源的相册里存在时，自动去重不等于已加入新相册。对这类重复相册归属问题后续需单独开发“关联现有媒体到相册”，不得无条件重复上传。
+
 ### Mac M2 Local WebUI / 本地网页管理
 
 The independent local dashboard resides in webui/, using Python 3 standard library only. It does not mount Android/DCIM and does not read or modify MI3MountMac. It binds exclusively to 127.0.0.1 and both monitoring and upload begin OFF.

@@ -58,9 +58,83 @@ class WebUITest(unittest.TestCase):
         self.assertIn("controls.appendChild(index)", js)
         self.assertIn("controls.appendChild(remove)", js)
         self.assertIn("grid-template-columns: 42px minmax(0, 1fr) auto", css)
+        self.assertIn(".source-album-form", css)
+        self.assertIn("source-album-settings", js)
+        self.assertIn("保存并确认相册", js)
+        self.assertIn("仅试传 1 张照片", js)
         self.assertIn(".source-entry > .source-meta", css)
         self.assertIn("text-overflow: ellipsis", css)
         self.assertIn("@media (max-width: 1110px)", css)
+
+    def test_album_default_requires_explicit_confirmation(self):
+        self.store.add_source(str(self.source), "directory")
+        self.wait_for_jobs(2)
+        source = self.store.sources()[0]
+        self.assertEqual(source["album_name"], "source")
+        self.assertEqual(source["album_confirmed"], 0)
+        self.assertIsNone(self.store._next_job())  # A queued job is not uploadable yet.
+        with self.assertRaises(UserError):
+            self.store.set_album(source["id"], "\ninvalid")
+        with self.assertRaises(UserError):
+            self.store.set_album(source["id"], " " * 4)
+        self.store.set_album(source["id"], "2020@11月行程 南宁武汉贵州长白山")
+        self.assertEqual(self.store.sources()[0]["album_confirmed"], 1)
+        self.assertEqual(self.store.sources()[0]["album_name"],
+                         "2020@11月行程 南宁武汉贵州长白山")
+        self.assertIsNotNone(self.store._next_job())
+        self.assertTrue(any(event["action"] == "album_confirmed"
+                            for event in self.store.source_events(source["id"])))
+        self.store.upload_enabled = True
+        with self.assertRaises(UserError):
+            self.store.set_album(source["id"], "Changed While Uploading")
+
+    def test_cli_album_flag_and_single_image_mode(self):
+        self.store.add_source(str(self.source), "directory")
+        self.wait_for_jobs(2)
+        source_id = self.store.sources()[0]["id"]
+        self.store.set_album(source_id, "旅程测试相册")
+        job = self.store.jobs()[0]
+        with mock.patch("webui.server.subprocess.run",
+                        return_value=mock.Mock(returncode=0,
+                                               stdout='{"mediaKey":"MOCK_MEDIA_KEY"}')) as cmd:
+            ok, key, error = self.store._run_upload(job)
+        self.assertTrue(ok)
+        self.assertEqual(key, "MOCK_MEDIA_KEY")
+        args = cmd.call_args.args[0]
+        self.assertIn("--saver", args)
+        self.assertEqual(args[args.index("--album") + 1], "旅程测试相册")
+        self.assertNotIn("--delete", args)
+        self.assertNotIn("--force", args)
+        # Simulate an explicit one-photo request without using a Google account.
+        self.store.allow_upload = True
+        self.store.credentials.write_text("FAKE_TOKEN_NOT_A_CREDENTIAL")
+        self.store.credentials.chmod(0o600)
+        self.store._run_upload = mock.Mock(return_value=(True, "MOCK_ONE", ""))
+        with mock.patch.object(self.store, "_ensure_upload_ready"):
+            result = self.store.test_one_image(source_id)
+        self.assertEqual(result["status"], "api_accepted")
+        self.assertEqual(result["album"], "旅程测试相册")
+        self.store._run_upload.assert_called_once()
+        self.assertFalse(self.store.upload_enabled)  # Never opens the batch gate.
+
+    def test_album_persists_after_hide_remove_and_readd(self):
+        self.store.add_source(str(self.source), "directory")
+        self.wait_for_jobs(2)
+        source_id = self.store.sources()[0]["id"]
+        self.store.set_album(source_id, "南宁武汉贵州长白山")
+        self.store.set_display(source_id, "removed")
+        with mock.patch.object(self.store, "request_scan") as request_scan:
+            self.store.add_source(str(self.source), "directory")
+            request_scan.assert_not_called()
+        source = self.store.sources()[0]
+        self.assertEqual(source["id"], source_id)
+        self.assertEqual(source["album_name"], "南宁武汉贵州长白山")
+        self.assertEqual(source["album_confirmed"], 1)
+        other = Store(self.base / "state", worker=False)
+        try:
+            self.assertEqual(other.sources()[0]["album_name"], "南宁武汉贵州长白山")
+        finally:
+            other.close()
 
     def test_add_folder_and_detect_dedup(self):
         self.store.add_source(str(self.source), "directory")
@@ -90,6 +164,7 @@ class WebUITest(unittest.TestCase):
     def test_mock_upload_retry_and_cross_path_dedup(self):
         self.store.add_source(str(self.source), "directory")
         self.wait_for_jobs(2)
+        self.store.set_album(self.store.sources()[0]["id"], "Mock Album")
         self.store.allow_upload = True
         self.store.cli = self.base / "mock_cli_binary"
         self.store.cli.write_bytes(b"dummy")
@@ -116,6 +191,7 @@ class WebUITest(unittest.TestCase):
     def test_failed_job_can_retry(self):
         self.store.add_source(str(self.media1), "file")
         self.wait_for_jobs(1)
+        self.store.set_album(self.store.sources()[0]["id"], "Mock Album")
         self.store.allow_upload = True
         self.store.cli = self.base / "cli"
         self.store.cli.write_bytes(b"mock")
@@ -226,6 +302,15 @@ class WebUITest(unittest.TestCase):
         self.wait_for_jobs(1)
         job_id = self.store.jobs()[0]["id"]
         source_id = self.store.sources()[0]["id"]
+        status, _ = req("POST", "/api/source/test-upload", {"id": source_id},
+                        {"X-GU-CSRF": token})
+        self.assertEqual(status, 400)  # Isolated credentials absent.
+        status, album = req("POST", "/api/source/album",
+                            {"id": source_id, "album_name": "旅行相册"},
+                            {"X-GU-CSRF": token})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.store.sources()[0]["album_name"], "旅行相册")
+        self.assertEqual(self.store.sources()[0]["album_confirmed"], 1)
         with self.store.connection() as con:
             con.execute("UPDATE jobs SET status='api_accepted' WHERE id=?", (job_id,))
         status, _ = req("POST", "/api/cloud/verify", {"id": job_id, "verified": True},

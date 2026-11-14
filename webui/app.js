@@ -9,6 +9,8 @@ let modalKind = "directory";
 let selectedSourceId = "";
 let showHiddenRecords = false;
 const expandedEventSources = new Set();
+const expandedAlbumSources = new Set();
+const albumDrafts = new Map();
 let pageOffset = 0;
 const pageSize = 100;
 
@@ -119,6 +121,9 @@ function renderSources(sources) {
     info.appendChild(element("small", "source-badges",
       "已索引 " + source.indexed_files + " 项（图片 " + source.images + " / 视频 " + source.videos +
       "）· API 已接收 " + source.api_accepted + " · 云端人工核验 " + source.cloud_verified));
+    info.appendChild(element("small", "source-album-caption",
+      "Google Photos 相册：" + (source.album_name || "尚未设定") +
+      (source.album_confirmed ? " · 已确认" : " · 待确认，禁止上传")));
     row.appendChild(info);
     // Keep every action inside ONE grid cell. Previously they were siblings of
     // the text column and a full-width <details>; flexbox compressed the path
@@ -199,6 +204,62 @@ function renderSources(sources) {
     });
     if (expandedEventSources.has(source.id)) events.open = true;
     row.appendChild(events);
+
+    const album = element("details", "source-album-settings");
+    const summary = element("summary", null, "相册名称与单张试传");
+    album.appendChild(summary);
+    const albumBody = element("div", "source-album-form");
+    const input = element("input", "album-name-input");
+    input.type = "text";
+    input.maxLength = 120;
+    input.autocomplete = "off";
+    input.placeholder = "Google Photos 相册名称";
+    input.value = albumDrafts.get(source.id) ?? source.album_name ?? "";
+    input.addEventListener("input", () => albumDrafts.set(source.id, input.value));
+    input.title = "默认使用来源文件夹名称，可改为旅行名称，再点击保存并确认";
+    albumBody.appendChild(input);
+    const confirmAlbum = element("button", "btn primary", "保存并确认相册");
+    confirmAlbum.type = "button";
+    confirmAlbum.addEventListener("click", async () => {
+      try {
+        const result = await post("/api/source/album",
+          {id: source.id, album_name: input.value});
+        albumDrafts.delete(source.id);
+        notice("已确认相册：" + input.value + "。历史文件不会自动重传。", true);
+        await refresh();
+      } catch (error) { notice(error.message); }
+    });
+    albumBody.appendChild(confirmAlbum);
+    const test = element("button", "btn soft", "仅试传 1 张照片");
+    test.type = "button";
+    test.disabled = !source.album_confirmed || !currentStatus?.allow_real_upload
+      || !currentStatus?.credentials_present || currentStatus?.upload_enabled;
+    test.title = !source.album_confirmed ? "请先确认相册名称" :
+      !currentStatus?.credentials_present ? "请先在 Mac 本机完成独立账号授权" :
+      !currentStatus?.allow_real_upload ? "需以 --allow-real-upload 重启 WebUI" :
+      currentStatus?.upload_enabled ? "请先关闭批量上传开关" : "只上传最小的一张未上传照片";
+    test.addEventListener("click", async () => {
+      if (!confirm("只从此来源挑选 1 张未上传的照片，使用独立账号上传到相册「" +
+        source.album_name + "」。这会产生真实 Google Photos 网络请求。继续吗？")) return;
+      test.disabled = true;
+      try {
+        const result = await post("/api/source/test-upload", {id: source.id});
+        const job = result.test;
+        notice("单张测试结果：" + job.name + " · " + job.status +
+          (job.error ? " · " + job.error : " · 请进入 Google Photos 官方页面核对相册和配额"), true);
+        await refresh();
+      } catch (error) { notice(error.message); test.disabled = false; }
+    });
+    albumBody.appendChild(test);
+    albumBody.appendChild(element("small", "source-album-hint",
+      "先确认名称，再执行单张测试。API 接收不等于官方云端核验，修改名称不会自动移动此前上传的文件。"));
+    album.appendChild(albumBody);
+    album.addEventListener("toggle", () => {
+      if (album.open) expandedAlbumSources.add(source.id);
+      else expandedAlbumSources.delete(source.id);
+    });
+    if (expandedAlbumSources.has(source.id)) album.open = true;
+    row.appendChild(album);
     target.appendChild(row);
   }
 }
