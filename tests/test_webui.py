@@ -140,6 +140,25 @@ class WebUITest(unittest.TestCase):
         finally:
             other.close()
 
+    def test_owned_engine_requires_fixed_build_path_and_fail_closed(self):
+        with self.assertRaises(UserError):
+            Store(self.base / "invalid", engine="unknown", worker=False)
+        fake = self.base / "not-the-local-build"
+        fake.write_bytes(b"FAKE_CLI")
+        owned = Store(self.base / "separate-owned", worker=False, engine="owned",
+                      allow_upload=True, cli=fake)
+        try:
+            owned.credentials.write_text("INERT-TEST-ONLY", encoding="utf-8")
+            owned.credentials.chmod(0o600)
+            with mock.patch("webui.server.verify_owned_engine",
+                            return_value=(True, "fake verifier")):
+                with self.assertRaises(UserError):
+                    owned.set_upload(True)
+            self.assertFalse(owned.upload_enabled)
+            self.assertEqual(owned.status()["upload_engine"], "owned")
+        finally:
+            owned.close()
+
     def test_add_folder_and_detect_dedup(self):
         self.store.add_source(str(self.source), "directory")
         self.wait_for_jobs(2)
@@ -182,6 +201,7 @@ class WebUITest(unittest.TestCase):
                 return False, "", "mock timeout"
             return True, "MOCK_MEDIA_KEY_NOT_CLOUD_VERIFIED", ""
         self.store._run_upload = fake_upload
+        self.store._ensure_upload_ready = mock.Mock()  # Mock CLI has no real signed binary.
         self.assertTrue(self.store.run_one())
         self.assertEqual(len([x for x in self.store.jobs() if x["status"] == "retrying"]), 1)
         # The second identical item can be accepted independently if no success existed.
@@ -203,6 +223,7 @@ class WebUITest(unittest.TestCase):
         self.store.credentials.chmod(0o600)
         self.store.upload_enabled = True
         self.store._run_upload = lambda _: (False, "", "mock failure")
+        self.store._ensure_upload_ready = mock.Mock()  # No real credentials or CLI.
         for attempt in range(3):
             self.assertTrue(self.store.run_one())
             with self.store.connection() as con:

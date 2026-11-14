@@ -29,6 +29,7 @@ jobs:
       - name: Bash Syntax Validation (bash -n)
         run: |
           bash -n google-unlimited.sh
+          bash -n scripts/build_local_uploader.sh scripts/authorize_local.sh
           for f in tests/*.sh; do
             bash -n "$f"
           done
@@ -69,7 +70,7 @@ jobs:
         run: ./tests/run_all_tests.sh
 
       - name: Run Independent WebUI Tests (no Google credentials)
-        run: python3 -m unittest discover -s tests -p 'test_webui.py' -v
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
 
   test-windows:
     name: Windows Regression Tests (PowerShell)
@@ -103,7 +104,7 @@ jobs:
           ./tests/test_watch_paths.sh
 
       - name: Run Local WebUI Tests (no Google credentials)
-        run: python3 -m unittest discover -s tests -p 'test_webui.py' -v
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
 
       - name: Validate LaunchAgent Plist Configuration (REL-01)
         run: |

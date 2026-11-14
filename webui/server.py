@@ -20,6 +20,8 @@ import time
 from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+from engine.verify_local_build import verify as verify_owned_engine
 STATIC = Path(__file__).resolve().parent
 DEFAULT_STATE = STATIC / "state"
 MEDIA = frozenset(("jpg jpeg png heic heif webp gif bmp tiff tif avif dng raw cr2 cr3 nef arw orf rw2 pef srw raf mp4 mov mkv avi m4v 3gp 3g2 wmv webm mpg mpeg mts m2ts ts flv vob").split())
@@ -50,13 +52,19 @@ class UserError(Exception):
 class Store:
     """Independent database, directory configuration and uploader worker."""
 
-    def __init__(self, state_dir=None, *, allow_upload=False, cli=None, worker=True):
+    def __init__(self, state_dir=None, *, allow_upload=False, cli=None,
+                 engine="release", worker=True):
+        if engine not in ("release", "owned"):
+            raise UserError("上传引擎必须为 release 或 owned")
         self.state_dir = Path(state_dir or DEFAULT_STATE).expanduser().resolve()
         self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.state_dir.chmod(0o700)
         self.db = self.state_dir / "queue.sqlite3"
         self.credentials = self.state_dir / "gotohp.config"
-        self.cli = Path(cli or ROOT / "gotohp-cli-macos-universal")
+        self.engine = engine
+        self.cli = Path(cli or (
+            ROOT / "engine/bin/gotohp-cli-owned-arm64" if engine == "owned"
+            else ROOT / "gotohp-cli-macos-universal"))
         self.allow_upload = allow_upload
         self.upload_enabled = False  # NEVER persist auto-upload across restart
         self.monitor_enabled = False  # NEVER watch or import user's folders by default
@@ -501,9 +509,14 @@ class Store:
             stored_files = con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
         credentials_present = self.credentials.is_file() and self.credentials.stat().st_mode & 0o077 == 0
         cli_present = self.cli.is_file()
+        owned_verified = False
+        if self.engine == "owned" and cli_present:
+            owned_verified, _ = verify_owned_engine(ROOT)
         return {"monitor_enabled": self.monitor_enabled, "upload_enabled": self.upload_enabled,
                 "allow_real_upload": self.allow_upload, "credentials_present": credentials_present,
-                "cli_present": cli_present, "scan_running": self.scan_running,
+                "cli_present": cli_present, "upload_engine": self.engine,
+                "owned_build_verified": owned_verified,
+                "scan_running": self.scan_running,
                 "last_scan": self.last_scan, "last_scan_error": self.last_scan_error,
                 "sources": self.sources(include_hidden=include_hidden),
                 "hidden_sources": hidden_sources,
@@ -805,10 +818,18 @@ class Store:
     def _ensure_upload_ready(self):
         if not self._auth_ready():
             raise UserError("真实上传未开放：请先在 Mac 本机完成独立账号授权，并用 --allow-real-upload 启动")
-        if self.cli.resolve() != (ROOT / "gotohp-cli-macos-universal").resolve():
-            raise UserError("仅允许使用已确认的本机 gotohp 上传引擎路径")
-        if self._digest(self.cli) != PINNED_MAC_CLI_SHA256:
-            raise UserError("gotohp 上传引擎 SHA-256 校验失败，拒绝上传")
+        if self.engine == "owned":
+            expected = ROOT / "engine/bin/gotohp-cli-owned-arm64"
+            if self.cli.resolve() != expected.resolve():
+                raise UserError("只允许使用本项目自行编译的上传引擎")
+            ok, reason = verify_owned_engine(ROOT)
+            if not ok:
+                raise UserError("本地上传引擎验证失败：" + reason)
+        else:
+            if self.cli.resolve() != (ROOT / "gotohp-cli-macos-universal").resolve():
+                raise UserError("仅允许使用已确认的发行版上传引擎路径")
+            if self._digest(self.cli) != PINNED_MAC_CLI_SHA256:
+                raise UserError("发行版上传引擎 SHA-256 校验失败，拒绝上传")
 
     def retry(self, job_id):
         with self.connection() as con:
@@ -875,6 +896,12 @@ class Store:
 
     def run_one(self, *, source_id=None, image_only=False, manual=False):
         if not ((manual or self.upload_enabled) and self._auth_ready()):
+            return False
+        # Refuse a replaced executable and stop the bulk worker safely.
+        try:
+            self._ensure_upload_ready()
+        except UserError:
+            self.upload_enabled = False
             return False
         job = self._next_job(source_id=source_id, image_only=image_only)
         if job is None:
@@ -1129,10 +1156,13 @@ def main():
     parser = argparse.ArgumentParser(description="GoogleUnlimited local-only dashboard")
     parser.add_argument("--port", type=int, default=8796)
     parser.add_argument("--state-dir", default=str(DEFAULT_STATE))
+    parser.add_argument("--engine", choices=("release", "owned"), default="release",
+                        help="Select verified release CLI or self-compiled local CLI")
     parser.add_argument("--allow-real-upload", action="store_true",
                         help="Enable manual upload switch after independent Google credentials setup")
     args = parser.parse_args()
-    store = Store(args.state_dir, allow_upload=args.allow_real_upload)
+    store = Store(args.state_dir, allow_upload=args.allow_real_upload,
+                  engine=args.engine)
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(store))
     print(f"GoogleUnlimited WebUI: http://127.0.0.1:{server.server_port}", flush=True)
     print("Upload initially OFF; monitoring initially OFF; independent state only.", flush=True)

@@ -36,3 +36,7 @@ webui/state/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Self-compiled local uploader binaries, manifests and temporary Git checkout.
+engine/bin/
+engine/upstream-gotohp/

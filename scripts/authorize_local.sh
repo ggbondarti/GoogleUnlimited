@@ -3,7 +3,7 @@
 set -euo pipefail
 umask 077
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CLI="$ROOT/gotohp-cli-macos-universal"
+CLI="$ROOT/engine/bin/gotohp-cli-owned-arm64"
 STATE="$ROOT/webui/state"
 CONFIG="$STATE/gotohp.config"
 
@@ -11,8 +11,8 @@ if [[ ! -t 0 ]]; then
   echo "请直接在 Mac M2 Terminal 中运行，禁止通过远程命令传递敏感 Token。" >&2
   exit 2
 fi
-if [[ ! -f "$CLI" ]]; then
-  echo "找不到独立 gotohp-cli-macos-universal 上传引擎。" >&2
+if [[ ! -x "$CLI" ]] || ! python3 "$ROOT/engine/verify_local_build.py"; then
+  echo "自行编译上传引擎尚未验证成功；请先运行 bash scripts/build_local_uploader.sh" >&2
   exit 1
 fi
 mkdir -p "$STATE"
@@ -30,12 +30,12 @@ if [[ -z "$AUTH_TOKEN" ]]; then
   echo "没有输入 token；未修改配置。" >&2
   exit 2
 fi
-if printf '%s\n' "$AUTH_TOKEN" | "$CLI" --config "$CONFIG" creds add - >/dev/null; then
+if printf '%s\n' "$AUTH_TOKEN" | "$CLI" --config "$CONFIG" creds add - >/dev/null 2>&1; then
   unset AUTH_TOKEN
   chmod 600 "$CONFIG"
-  echo "授权请求已完成，账号凭据保存在本机 webui/state/gotohp.config (0600)。"
+  echo "授权请求已完成，凭据仅保存在本机 webui/state/gotohp.config (0600)。"
   echo "请使用以下命令核对账号邮箱（不要显示文件内容）："
-  echo ""$CLI" --config "$CONFIG" creds list"
+  printf '%q --config %q creds list\n' "$CLI" "$CONFIG"
 else
   unset AUTH_TOKEN
   echo "授权失败或 Token 已过期；请重新完成 Embedded Setup 后再试。" >&2

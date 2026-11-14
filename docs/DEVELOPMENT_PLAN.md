@@ -249,6 +249,28 @@ bash google-unlimited.sh help
 
 **本机实测（2026-11-14）**：Python 24 项测试全部通过（较前次新增 3 项相册相关测试；HTTP/API 验证也覆盖无凭据拒绝试传和确认保存），JS/Python/shell 语法及 `git diff --check` 通过。初始生产 DB 在更改相册设置前使用 SQLite `backup()` 备份到 `webui/state/queue.pre-album-20261114.sqlite3`，不提交 Git。只重启 Mac M2 上经进程名和端口核验的 GoogleUnlimited 8796 服务；现场 HTTP 200，上传/目录监控 OFF，`allow_real_upload=false`，独立凭据文件不存在。针对目标来源 ID 2 预填 `2020@11月行程 南宁武汉贵州长白山`、`album_confirmed=0`，原任务状态严格不变：来源 1 有 369 项 queued，来源 2 有 217 项 queued，合计 586 项；目录和照片均未删除。首个安全单图候选为来源 2 中约 3,763,142 字节的 JPG（仅核对存在和大小，不上传）。第一波“试传 1 张照片”目前**只完成模拟上传测试，真实试传受独立账号授权缺失阻断**；本地 Chrome Profile 登录不能自动替代 gotohp 认证。后续用户本人运行 `bash scripts/authorize_local.sh`，确认正确账号后再使用 WebUI 的相册确认与单张上传按钮。跨平台 GitHub CI 最终已验收：源码提交 `c0dba3d` 最初的 Linux/macOS 测试因 Runner 没有本地 gotohp 二进制而触发模拟测试门禁（非真实上传错误）；修正测试改为创建独立假 CLI 文件，生产安全门禁不变。补丁提交 `ae5cb6b8358e710043c81ffd5e094f8bf7ce329e` 已推送主分支，GitHub Actions [43610882190](https://github.com/samni728/GoogleUnlimited/actions/runs/43610882190) 的 Lint、macOS、Linux 和 Windows 四组测试全部 **success**。独立 Google 凭据尚未建立，首批真实上传仍为等待用户本机授权。
 
+### 9.9 自主构建 Mac 直传引擎（2026-11-14）
+
+**目标**：把 GoogleUnlimited 现有自研 WebUI/SQLite/NAS/相册管理与第三方预编译 CLI 解耦，用自己固定版本源码、自己编译的 Go 程序，在 Mac M2 上直接发送照片到 Google Photos。**不能**因为小米 3 已获得免配额，就自动假设 Mac 同一账号直接上传也免费；须以实际云端用量验证。
+
+- **上游来源核验**：gotohp v0.11.0，Git tag `68ad61fc844a060ce0e09c0b0524dd799c14170c`，MIT LICENSE Copyright 2024 xob0t。上游 CLI 通过 `go build -tags cli` 构建，核心 Go 源码目录为 `backend/`、`generated/`、`internal/`。固定约 50 个 CLI 必要源码/资源文件到 `engine/gotohp-src/`（约 721KB），不提交临时克隆目录的 .git、前端 GUI 或构建产物。源码仍是第三方作者的代码；我们的自主性在于本地保存、持续审查、修改、编译、运行及完全控制队列、日志、账号、服务器，**不是宣称所有上游代码原创**。
+- **部分静态安全检查**：核心代码可见的 HTTP 访问位置包括 `android.clients.google.com/auth`、`android.googleapis.com/auth`、`photos.googleapis.com`、`photosdata-pa.googleapis.com`，这只是字符串级检查，不代表完整依赖/动态网络流量审计、也不保证不会外泄。编译和源码审查不读取用户 Google Cookie、MasterToken 或 Android AccountManager 数据。
+- **构建**：`scripts/build_local_uploader.sh` 在 Mac ARM64 核对源版本和 MIT 声明、使用 `CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -tags cli -trimpath -buildvcs=false`。上游 go.mod 要求 Go 1.27；Mac M2 原来安装 Go 1.25.6，因此需要下载 Go 1.27 工具链和 Go 依赖，编译结果视真实测试而定。输出 `engine/bin/gotohp-cli-owned-arm64` + `engine/bin/owned-build.json`，两者被 Git 忽略，清单存源版本、源文件集合摘要、二进制 SHA256、平台与 Go 版本，不存用户账号信息。
+- **运行时校验**：`engine/verify_local_build.py` 通过标准库重新计算源码树与本地二进制的 SHA-256，拒绝替换文件、软链接、版本不匹配和编译清单失效。WebUI 新增 `--engine owned|release`；`owned` 必须使用固定目录的已验证本地产物，`release` 只接受之前固定 SHA-256 的发布版，选择不成功时不会静默回退；更换引擎需重启 WebUI，**真实上传开关重启后始终 OFF**。上传仍需独立账号、启动参数 `--allow-real-upload`、来源相册人工确认。
+- **本地授权**：`scripts/authorize_local.sh` 已改为只调用通过校验的本地编译 CLI，禁止脚本从远程 NexusDock 导入/上传 Cookie。原手工授权流程保留，但不意味着自动实现“小米 3 签名设备身份”的迁移；未来如需 Android 端授权桥接，应先论证设备绑定/可撤销性，明确密钥不得写入仓库/日志，不能以伪造 User-Agent 代替服务器认可。
+- **第一张照片验证流程**：先独立授权账号，再从已确认相册的来源主动点击单张测试，分别记录 `mac_api_accepted`、`cloud_visible` 和 `storage_usage_delta` 三个独立指标；任何一个失败，保留原文件和队列，不开启大批量。用户此前验证小米 3 多 GB Storage Saver 不占配额，作为**手机端参考对照，不代表 Mac 端得到相同待遇**。
+- **持续隔离**：不修改 MI3MountMac、Pixelify、手机当前 Google Photos 或任何既有设备凭据；不复用小米 3 的数据库；原 586 条媒体、NAS 子目录、相册和历史记录保持完整。真实构建/本机 HTTP/CI 状态应记录在本节追加验收行，不凭代码存在宣称成功。
+
+**2026-11-14 本机编译与隔离部署完成：** 已从上游 v0.11.0 提交 `68ad61fc844a060ce0e09c0b0524dd799c14170c` 的固定 Go 源码独立编译 Mac ARM64 CLI，使用 Go **1.27.0**，`--version` 输出 `gotohp v0.11.0`，支持 `--saver` 与 `--album`。本机二进制 SHA-256：`13a342126a28930a1a503b2d9b6dba0b0fccd758123d9783edbe8c9b22628d7d`，`engine/verify_local_build.py` 实测 **PASS**（源码与二进制均校验）；构建产物与 manifest 在 `engine/bin/`，被 Git 忽略。项目增加 6 个纯离线 Python 校验测试，加上原 WebUI 测试总计 **31 项全部通过**，并把这组测试加入 Linux/macOS CI。上传引擎以 `--engine owned` 显式选择，默认认证和上传门禁维持。
+
+**Mac M2 WebUI 实例验收：** 重启前对运行于 `127.0.0.1:8796` 的已确认本项目进程检查监控/上传双 OFF，使用 SQLite 原生备份生成 `webui/state/queue.pre-owned-engine-20261114.sqlite3`；重启后以 `python3 webui/server.py --port 8796 --engine owned` 运行。HTTP **200**，API 返回 `upload_engine=owned`、`owned_build_verified=true`，监控/上传/允许真实上传全部 false；SQLite `queued=586`、`folder_index=9`、来源数 2、相册设置均与重启前严格一致。该部署尚无独立账号凭据，**未进行 Google Photos 真实上传，也未证明 Mac 继承小米 3 的 Pixel 免费容量政策**。
+
+**设备只读对照：** 小米 3 当前 ADB 可连，`ro.build.version.release=11`，`ro.product.model=MI 3W`；因此应用内 Pixelify 身份模拟未体现在此全局属性。**复制 Android 系统型号或 gotohp 里 Pixel XL 的 User-Agent，均不能替代云端对实际备份来源及资格的判断。** 目前没有提取、复制、储存或通过 NexusDock 传输手机 Google AccountManager/Photos 的任何认证凭据。
+
+**Go CLI 单元测试验收边界**：额外尝试在临时 HOME 中执行 `go test -tags cli -count=1 ./backend ./internal/cli`，因第一次完整测试构建大型依赖触发执行超时，未形成成功结果；本机 `go build -tags cli` 已成功，二进制版本和源码 SHA 校验也通过。**不能把超时的 Go 测试写成通过。** GitHub 端只运行不需要 Google 凭据的 Python/接口安全测试，源码构建结果以本机真实编译为证。
+
+**仍待完成的关键验收**：在用户自己批准并完成本机安全凭据配置后，从 Mac 自编译 CLI 指定相册主动上传一张照片，核查官方相册出现与相同 Google 账号的实际存储用量前后差（留出统计延迟）；若容量增加或认证失败，就不能宣称已实现 Mac 免费无限备份。未来可以研究手机授权桥接或独立认证模块，但需确认 Android 硬件绑定/签名能力与安全性，不能仅复制可见型号。Go 源码来自 MIT 上游，不能以“自己编译”代替完整的安全审计。
+
 ## 10. 之前阶段待办与交接
 
 

@@ -430,6 +430,9 @@ async function refresh() {
     $("upload-switch").checked = status.upload_enabled;
     $("credential-state").textContent = status.credentials_present
       ? "存在本机凭据（有效性未验证）" : "尚未配置独立账号";
+    $("engine-state").textContent = status.upload_engine === "owned"
+      ? (status.owned_build_verified ? "自行编译 · SHA 校验通过" : "自行编译 · 尚未通过构建验证")
+      : "第三方发行版 · 固定 SHA-256";
     $("upload-reason").textContent = status.allow_real_upload
       ? (status.credentials_present ? "独立凭据存在，可手动启动或停止" : "缺少独立凭据，无法上传")
       : "安全锁定：需在本机启动参数显式启用上传";

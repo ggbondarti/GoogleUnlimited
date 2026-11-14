@@ -54,6 +54,26 @@ bash tests/test_macos_binary_selection.sh
 
 **上传警告：** GoogleUnlimited/gotohp 是依赖非公开 Google Photos 接口的第三方项目，Google 可能拒绝授权或改变接口；未经云端验证不能称为完成备份。跨目录同 SHA-256 内容去重仍使用原有 SQLite 逻辑；文件在其他来源的相册里存在时，自动去重不等于已加入新相册。对这类重复相册归属问题后续需单独开发“关联现有媒体到相册”，不得无条件重复上传。
 
+### 自行编译、Mac M2 直接上传（受控本地引擎）
+
+本仓库现包含 **gotohp v0.11.0 的固定 MIT CLI 源码副本**（`engine/gotohp-src/`，上游提交 `68ad61fc844a060ce0e09c0b0524dd799c14170c`，保留 LICENSE）。Mac M2 可自主构建、验证和运行，无需信任别人发布的 CLI 二进制；但代码起源仍是 xob0t 的 gotohp，而非全部从零重写。
+
+在 Mac M2 本机编译（Go 工具链按 go.mod 需 Go 1.27）：
+
+    cd "/Users/samni/Desktop/开发项目/GoogleUnlimited"
+    bash scripts/build_local_uploader.sh
+    python3 engine/verify_local_build.py
+
+生成的 `engine/bin/gotohp-cli-owned-arm64` 和 `engine/bin/owned-build.json` 由 Git 忽略；WebUI 只从本项目固定目录选择引擎，使用时比对源码树和二进制 SHA-256。不匹配时拒绝上传，不会自动退回陌生的发布版。
+
+只测试 WebUI/SQLite（**不开始 Google 上传**）：
+
+    python3 webui/server.py --port 8796 --engine owned
+
+正式测试仍需独立账号凭据、显式加上 `--allow-real-upload` 启动参数、在页面确认相册、手动试传 **1 张**。两种引擎可选：`--engine owned`（自己编译）和 `--engine release`（前期已验哈希的第三方发行版），不会混用。独立账号授权脚本已改为仅接受通过 SHA 校验的自编译 CLI。
+
+**小米 3 身份与免配额必须分开验证。** gotohp 会模拟 Android Photos 网络协议，使用来自 Android 登录流程的凭据，但 Mac 直接发出网络请求并不自动取得 Pixel 5 的资格。手机压缩模式实际不占配额是用户已确认的基线；需在同一账号用 Mac 上传单张图后，分别核对相册是否出现、账号空间是否变化，以及相关计费更新延迟。未验证前不能写作“Mac 无限备份已完成”。不读取或发送 Android/Chrome 登录令牌到 Agent 日志、聊天或 GitHub。参见 [docs/DEVELOPMENT_PLAN.md](docs/DEVELOPMENT_PLAN.md)。
+
 ### Mac M2 Local WebUI / 本地网页管理
 
 The independent local dashboard resides in webui/, using Python 3 standard library only. It does not mount Android/DCIM and does not read or modify MI3MountMac. It binds exclusively to 127.0.0.1 and both monitoring and upload begin OFF.
