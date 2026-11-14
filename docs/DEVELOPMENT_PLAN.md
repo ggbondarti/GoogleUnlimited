@@ -1,6 +1,6 @@
 # GoogleUnlimited / Mac M2 原生 Google Photos 备份试验 — 唯一开发与交接文档
 
-> 最后更新：2026-11-14 00:51 (America/Los_Angeles)
+> 最后更新：2026-11-14 00:55 (America/Los_Angeles)
 > 负责执行节点：NexusDock mac-M2（`node_18eb67f64516bf229adb4927b6e076ff`）
 > 当前恢复任务 ID：`tsk_6c3a5c2675bfaefd`（前期任务 ID 和验收历史见下文）
 > 工作目录：`/Users/samni/Desktop/开发项目/GoogleUnlimited`
@@ -194,6 +194,8 @@ bash google-unlimited.sh help
 **后续真实 NAS 验收：** 将某个 SMB/NFS 远程目录挂载到 Mac 的 `/Volumes/...`，核对目录、图片/视频数量、断线/重连后的索引保持情况；只用另一个独立 Google 账号测试少量非隐私样本的真实上传，并在官方 Google Photos 页面及配额中核对，不能预设真实账号无限容量。
 
 **2026-11-14 00:51 本机最终验收：** macOS Python 17 项单测全部 PASS；Python 编译、Node.js JS 语法和 `git diff --check` 均通过。服务仅通过验证过的自身 PID 进行重启；`127.0.0.1:8796` 返回 HTTP 200，`/api/status` 586 条历史任务、来源 ID 1 归档禁用；`/api/jobs?limit=100&offset=100` 返回 100/586，`/api/jobs?source_id=1&kind=video&limit=100&offset=300` 返回 20/320；`/api/folders?source_id=1` 返回 9 个目录；`/api/volumes` 返回 200、当前网络共享数 0。新版 HTML 含网络盘入口和分页控件，JS 已加载；监控 OFF / 上传 OFF，没有真实 Google 请求、没有改动 MI3MountMac。GitHub 远端的新版 CI/提交必须另行核验。
+
+**2026-11-14 00:55 GitHub 验收：** 源码提交 `be9f1c795259a7740421ac636c4f6f3eac4547f5` 已非强制推送到 `samni728/GoogleUnlimited` 的 `main`，并通过 GitHub 重新读取 SHA、README/docs 验证。GitHub Actions [43577910219](https://github.com/samni728/GoogleUnlimited/actions/runs/43577910219) 已完成且结论 **success**：Lint & Static Analysis、macOS Regression、Linux Regression、Windows Regression 四组全部通过。该结论仅覆盖软件静态与无凭据回归测试，**未覆盖真实 NAS 的 Finder 授权挂载，也未覆盖任何 Google Photos 实际上传或云端配额核对**。
 
 ## 10. 之前阶段待办与交接
 
