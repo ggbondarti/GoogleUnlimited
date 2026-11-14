@@ -107,7 +107,8 @@ class Store:
                 location_kind TEXT NOT NULL DEFAULT 'local',
                 mount_root TEXT NOT NULL DEFAULT '',
                 availability TEXT NOT NULL DEFAULT 'unknown',
-                last_checked_at TEXT NOT NULL DEFAULT ''
+                last_checked_at TEXT NOT NULL DEFAULT '',
+                ui_visibility TEXT NOT NULL DEFAULT 'visible'
               );
               CREATE TABLE IF NOT EXISTS jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -150,6 +151,15 @@ class Store:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(source_id,path)
               );
+              CREATE TABLE IF NOT EXISTS source_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                note TEXT NOT NULL DEFAULT ''
+              );
+              CREATE INDEX IF NOT EXISTS idx_source_events_id
+                ON source_events(source_id,id);
             """)
             source_cols = {
                 "archived": "INTEGER NOT NULL DEFAULT 0",
@@ -157,6 +167,7 @@ class Store:
                 "mount_root": "TEXT NOT NULL DEFAULT ''",
                 "availability": "TEXT NOT NULL DEFAULT 'unknown'",
                 "last_checked_at": "TEXT NOT NULL DEFAULT ''",
+                "ui_visibility": "TEXT NOT NULL DEFAULT 'visible'",
             }
             job_cols = {
                 "mtime_ns": "INTEGER NOT NULL DEFAULT 0",
@@ -348,7 +359,7 @@ class Store:
         return {"path": str(directory), "parent": str(parent) if parent else None,
                 "folders": folders[:300], "files": files[:300]}
 
-    def sources(self):
+    def sources(self, include_hidden=True):
         with self.connection() as con:
             rows = [dict(r) for r in con.execute("""SELECT s.*,
                        (SELECT COUNT(*) FROM jobs j WHERE j.source_id=s.id) AS indexed_files,
@@ -357,13 +368,53 @@ class Store:
                        (SELECT COUNT(*) FROM jobs j WHERE j.source_id=s.id AND j.media_kind='video') AS videos,
                        (SELECT COUNT(*) FROM jobs j WHERE j.source_id=s.id AND j.status='api_accepted') AS api_accepted,
                        (SELECT COUNT(*) FROM jobs j WHERE j.source_id=s.id AND j.cloud_verified_at!='') AS cloud_verified
-                       FROM sources s ORDER BY s.archived,s.id DESC""")]
+                       FROM sources s WHERE (?=1 OR s.ui_visibility='visible')
+                       ORDER BY s.archived,s.id DESC""", (int(include_hidden),))]
         return rows
 
+    def source_events(self, source_id):
+        with self.connection() as con:
+            source = con.execute("SELECT id FROM sources WHERE id=?", (int(source_id),)).fetchone()
+            if not source:
+                raise UserError("历史来源不存在")
+            return [dict(row) for row in con.execute(
+                """SELECT id,source_id,action,created_at,note FROM source_events
+                   WHERE source_id=? ORDER BY id DESC LIMIT 80""", (int(source_id),))]
+
     @staticmethod
-    def _jobs_filter(source_id=None, kind=None, status=None):
+    def _event(con, source_id, action, note=""):
+        con.execute("""INSERT INTO source_events(source_id,action,created_at,note)
+                       VALUES(?,?,?,?)""", (source_id, action, now(), note))
+
+    def set_display(self, source_id, mode):
+        if mode not in ("visible", "hidden", "removed"):
+            raise UserError("无效的显示操作")
+        with self.connection() as con:
+            row = con.execute("SELECT id,ui_visibility FROM sources WHERE id=?",
+                              (int(source_id),)).fetchone()
+            if not row:
+                raise UserError("来源不存在")
+            if row["ui_visibility"] == mode:
+                pass
+            elif mode == "removed":
+                # Detach source without touching any job's progress or its files.
+                con.execute("""UPDATE sources SET ui_visibility='removed',archived=1,
+                               enabled=0,availability='archived',last_checked_at=? WHERE id=?""",
+                            (now(), int(source_id)))
+            else:
+                con.execute("UPDATE sources SET ui_visibility=? WHERE id=?",
+                            (mode, int(source_id)))
+            if row["ui_visibility"] != mode:
+                self._event(con, int(source_id), mode, "界面操作；文件及任务历史未删除")
+        return self.sources()
+
+    @staticmethod
+    def _jobs_filter(source_id=None, kind=None, status=None, include_hidden=True):
         query = " FROM jobs WHERE 1=1"
         params = []
+        if not include_hidden:
+            query += """ AND source_id IN
+                     (SELECT id FROM sources WHERE ui_visibility='visible')"""
         if source_id is not None:
             query += " AND source_id=?"
             params.append(int(source_id))
@@ -376,17 +427,18 @@ class Store:
             params.append(status)
         return query, params
 
-    def jobs_total(self, source_id=None, kind=None, status=None):
-        clause, params = self._jobs_filter(source_id, kind, status)
+    def jobs_total(self, source_id=None, kind=None, status=None, include_hidden=True):
+        clause, params = self._jobs_filter(source_id, kind, status, include_hidden)
         with self.connection() as con:
             return con.execute("SELECT COUNT(*)" + clause, params).fetchone()[0]
 
-    def jobs(self, limit=120, source_id=None, kind=None, status=None, offset=0):
+    def jobs(self, limit=120, source_id=None, kind=None, status=None,
+             offset=0, include_hidden=True):
         query = """SELECT id,path,name,source_id,bytes,digest,status,attempts,
                    media_kind,extension,first_seen_at,last_seen_at,
                    file_available,cloud_verified_at,cloud_verify_method,
                    retry_at,error,duplicate_of,updated_at"""
-        clause, params = self._jobs_filter(source_id, kind, status)
+        clause, params = self._jobs_filter(source_id, kind, status, include_hidden)
         query += clause + " ORDER BY id DESC LIMIT ? OFFSET ?"
         params.extend((min(500, max(1, int(limit))), min(1000000, max(0, int(offset)))))
         with self.connection() as con:
@@ -398,23 +450,32 @@ class Store:
             return [dict(row) for row in con.execute("""SELECT * FROM folder_index
                        WHERE source_id=? ORDER BY path LIMIT 500""", (int(source_id),))]
 
-    def status(self):
+    def status(self, include_hidden=True):
         with self.connection() as con:
-            rows = con.execute("SELECT status,COUNT(*) n,COALESCE(SUM(bytes),0) size FROM jobs GROUP BY status")
+            scope = ("" if include_hidden else
+                     " WHERE source_id IN (SELECT id FROM sources WHERE ui_visibility='visible')")
+            rows = con.execute("""SELECT status,COUNT(*) n,COALESCE(SUM(bytes),0) size
+                                  FROM jobs""" + scope + " GROUP BY status")
             counts = {r["status"]: {"count": r["n"], "bytes": r["size"]} for r in rows}
             indexed = con.execute("""SELECT COUNT(*) files,
                             SUM(CASE WHEN media_kind='image' THEN 1 ELSE 0 END) images,
                             SUM(CASE WHEN media_kind='video' THEN 1 ELSE 0 END) videos,
                             SUM(CASE WHEN cloud_verified_at!='' THEN 1 ELSE 0 END) manually_verified,
                             COALESCE(SUM(bytes),0) bytes
-                            FROM jobs""").fetchone()
+                            FROM jobs""" + scope).fetchone()
+            hidden_sources = con.execute("""SELECT COUNT(*) FROM sources
+                                 WHERE ui_visibility!='visible'""").fetchone()[0]
+            stored_files = con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
         credentials_present = self.credentials.is_file() and self.credentials.stat().st_mode & 0o077 == 0
         cli_present = self.cli.is_file()
         return {"monitor_enabled": self.monitor_enabled, "upload_enabled": self.upload_enabled,
                 "allow_real_upload": self.allow_upload, "credentials_present": credentials_present,
                 "cli_present": cli_present, "scan_running": self.scan_running,
                 "last_scan": self.last_scan, "last_scan_error": self.last_scan_error,
-                "sources": self.sources(), "counts": counts,
+                "sources": self.sources(include_hidden=include_hidden),
+                "hidden_sources": hidden_sources,
+                "stored_files": stored_files,
+                "counts": counts,
                 "indexed": {k: indexed[k] or 0 for k in indexed.keys()},
                 "supported_formats": {"image": sorted(IMAGE_EXTS), "video": sorted(VIDEO_EXTS)},
                 "cloud_verification": "not_available",
@@ -430,19 +491,25 @@ class Store:
                            if contained(Path(path), Path(v["path"]))]
         matched = max(network_matches, key=lambda v: len(v["path"])) if network_matches else None
         with self.connection() as con:
+            prior = con.execute("SELECT id,archived,ui_visibility FROM sources WHERE path=?",
+                                (path,)).fetchone()
             con.execute("""INSERT INTO sources
                            (path,kind,enabled,added_at,archived,location_kind,mount_root,availability,last_checked_at)
                            VALUES(?,?,1,?,0,?,?, 'online',?)
                            ON CONFLICT(path) DO UPDATE SET
-                           kind=excluded.kind,enabled=1,archived=0,
+                           kind=excluded.kind,enabled=1,archived=0,ui_visibility='visible',
                            location_kind=excluded.location_kind,mount_root=excluded.mount_root,
-                           availability='online',last_checked_at=excluded.last_checked_at""",
+                           availability='unknown',last_checked_at=excluded.last_checked_at""",
                         (path, kind, now(), "network" if matched else "local",
                          matched["path"] if matched else "", now()))
             source = con.execute("SELECT id FROM sources WHERE path=?", (path,)).fetchone()
-            con.execute("""UPDATE jobs SET status='queued',updated_at=?
-                           WHERE source_id=? AND status='paused'""", (now(), source["id"]))
-        self.request_scan()
+            self._event(con, source["id"],
+                        "reload" if prior else "added",
+                        "复用原索引与所有备份状态" if prior else "新增来源")
+        # Reload shows existing SQLite history immediately; never rescan
+        # a large share or alter previously accepted/paused jobs automatically.
+        if not prior:
+            self.request_scan()
         return self.sources()
 
     def _set_source(self, source_id, enabled=None, remove=False):
@@ -451,12 +518,12 @@ class Store:
             if not row:
                 raise UserError("该来源不存在")
             if remove:
-                # Archive only: keep source id, indexed folders and all job history.
+                # Backwards-compatible 'remove' means remove only from WebUI.
                 con.execute("""UPDATE sources SET archived=1,enabled=0,
-                               availability='archived',last_checked_at=? WHERE id=?""",
+                               ui_visibility='removed',availability='archived',
+                               last_checked_at=? WHERE id=?""",
                             (now(), source_id))
-                con.execute("""UPDATE jobs SET status='paused',updated_at=?
-                               WHERE source_id=? AND status IN ('queued','retrying')""", (now(), source_id))
+                self._event(con, source_id, "removed", "仅移除 WebUI 显示；保留全部原任务状态")
             else:
                 if row["archived"]:
                     raise UserError("此来源已归档，请先恢复历史来源")
@@ -479,10 +546,10 @@ class Store:
         # merely because the user opened its historical index.
         self._path(row["path"], kind=row["kind"])
         with self.connection() as con:
-            con.execute("""UPDATE sources SET archived=0,enabled=1,availability='unknown',
+            con.execute("""UPDATE sources SET archived=0,enabled=1,ui_visibility='visible',
+                           availability='unknown',
                            last_checked_at=? WHERE id=?""", (now(), source_id))
-            con.execute("""UPDATE jobs SET status='queued',updated_at=?
-                           WHERE source_id=? AND status='paused'""", (now(), source_id))
+            self._event(con, source_id, "restored", "保留既有媒体索引和上传状态")
         if self.monitor_enabled:
             self.request_scan()
         return self.sources()
@@ -865,7 +932,9 @@ def make_handler(store):
                     return self._json(404, {"error": "not found"})
                 return self._send(200, file.read_bytes(), mime=types[file.suffix])
             if uri.path == "/api/status":
-                return self._json(200, {**store.status(), "csrf": csrf})
+                q = parse_qs(uri.query)
+                show_all = q.get("include_hidden", ["0"])[0] == "1"
+                return self._json(200, {**store.status(include_hidden=show_all), "csrf": csrf})
             if uri.path == "/api/jobs":
                 try:
                     q = parse_qs(uri.query)
@@ -874,20 +943,33 @@ def make_handler(store):
                     status = q.get("status", [None])[0]
                     limit = min(500, max(1, int(q.get("limit", [120])[0])))
                     offset = min(1000000, max(0, int(q.get("offset", [0])[0])))
+                    show_all = q.get("include_hidden", ["0"])[0] == "1"
                     return self._json(200, {"jobs": store.jobs(
-                        limit=limit,offset=offset,source_id=source_id,kind=kind,status=status),
-                        "total": store.jobs_total(source_id=source_id,kind=kind,status=status),
+                        limit=limit,offset=offset,source_id=source_id,kind=kind,status=status,
+                        include_hidden=show_all),
+                        "total": store.jobs_total(source_id=source_id,kind=kind,status=status,
+                                                   include_hidden=show_all),
                         "limit": limit,"offset": offset})
                 except (ValueError, TypeError):
                     return self._json(400, {"error": "无效的查询参数"})
             if uri.path == "/api/folders":
                 try:
-                    source_id = int(parse_qs(uri.query)["source_id"][0])
+                    q = parse_qs(uri.query)
+                    source_id = int(q["source_id"][0])
+                    if q.get("include_hidden", ["0"])[0] != "1" and not any(
+                            s["id"] == source_id for s in store.sources(include_hidden=False)):
+                        return self._json(404, {"error": "此来源已隐藏，请先显示隐藏记录"})
                     return self._json(200, {"folders": store.folders(source_id)})
                 except (ValueError, KeyError, IndexError):
                     return self._json(400, {"error": "缺少有效的来源 ID"})
             if uri.path == "/api/volumes":
                 return self._json(200, store.volumes())
+            if uri.path == "/api/source/events":
+                try:
+                    source_id = int(parse_qs(uri.query)["source_id"][0])
+                    return self._json(200, {"events": store.source_events(source_id)})
+                except (KeyError, IndexError, ValueError):
+                    return self._json(400, {"error": "请输入来源 ID"})
             if uri.path == "/api/browse":
                 try:
                     path = parse_qs(uri.query).get("path", [None])[0]
@@ -920,6 +1002,9 @@ def make_handler(store):
                 elif uri == "/api/source/remove":
                     store._set_source(int(payload["id"]), remove=True)
                     result = {"sources": store.sources()}
+                elif uri == "/api/source/display":
+                    result = {"sources": store.set_display(
+                        int(payload["id"]), payload.get("mode"))}
                 elif uri == "/api/source/restore":
                     result = {"sources": store.restore_source(int(payload["id"]))}
                 elif uri == "/api/cloud/verify":

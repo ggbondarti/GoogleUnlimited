@@ -7,6 +7,8 @@ let browserDirectory = "";
 let selectedFile = "";
 let modalKind = "directory";
 let selectedSourceId = "";
+let showHiddenRecords = false;
+const expandedEventSources = new Set();
 let pageOffset = 0;
 const pageSize = 100;
 
@@ -88,7 +90,9 @@ function renderSources(sources) {
     const info = element("div", "source-meta");
     info.appendChild(element("strong", null, source.path.split("/").pop() || source.path));
     const badges = [source.location_kind === "network" ? "远程共享" : "本地 / 映射盘"];
-    if (source.archived) badges.push("已归档");
+    if (source.ui_visibility === "removed") badges.push("已从界面移除 · 历史保留");
+    else if (source.ui_visibility === "hidden") badges.push("已隐藏");
+    else if (source.archived) badges.push("已归档");
     else if (source.availability === "offline") badges.push("离线 · 历史保留");
     else if (source.availability === "interrupted") badges.push("扫描中断");
     else if (source.availability === "unknown") badges.push("等待重新扫描");
@@ -104,12 +108,19 @@ function renderSources(sources) {
       $("job-source-filter").value = String(source.id);
       selectedSourceId = String(source.id);
       pageOffset = 0;
+      $("index-details").open = true;
       showFolders(source);
       refresh();
       $("index").scrollIntoView({behavior: "smooth", block: "start"});
     });
     row.appendChild(index);
-    if (source.archived) {
+    if (source.ui_visibility !== "visible") {
+      const show = element("button", "btn soft", "显示");
+      show.addEventListener("click", () =>
+        action("/api/source/display", {id: source.id, mode: "visible"},
+          "已恢复界面显示，历史索引及备份状态没有改变"));
+      row.appendChild(show);
+    } else if (source.archived) {
       const restore = element("button", "btn primary", "恢复历史");
       restore.addEventListener("click", () =>
         action("/api/source/restore", {id: source.id},
@@ -126,14 +137,43 @@ function renderSources(sources) {
       const toggle = element("label", "switch");
       toggle.append(checkbox, element("span"));
       row.appendChild(toggle);
-      const archive = element("button", "btn warn", "归档");
-      archive.addEventListener("click", () => {
-        if (confirm("归档此来源？仅停止监控，SQLite 索引和历史备份状态会保留，不删除照片。")) {
-          action("/api/source/remove", {id: source.id}, "来源已归档，目录与文件索引保留，可随时恢复");
+    }
+    if (source.ui_visibility === "visible") {
+      const hide = element("button", "btn soft", "隐藏");
+      hide.title = "只隐藏页面显示，不改变监控和 SQLite 任务状态";
+      hide.addEventListener("click", () => action(
+        "/api/source/display", {id: source.id, mode: "hidden"},
+        "索引已隐藏，数据库和备份历史完整保留"));
+      row.appendChild(hide);
+      const remove = element("button", "btn warn", "删除显示");
+      remove.title = "移除本页映射并停止来源监控；不删除数据库及照片";
+      remove.addEventListener("click", () => {
+        if (confirm("只从 WebUI 删除显示并停止这条来源映射；不删除 SQLite 历史、上传进度或任何照片。确定吗？")) {
+          action("/api/source/display", {id: source.id, mode: "removed"},
+            "已从界面移除。SQLite 历史仍然保留，重新添加相同目录即可恢复");
         }
       });
-      row.appendChild(archive);
+      row.appendChild(remove);
     }
+    const events = element("details", "source-event-details");
+    const eventHeader = element("summary", null, "操作记录");
+    events.appendChild(eventHeader);
+    events.addEventListener("toggle", async () => {
+      if (events.open) expandedEventSources.add(source.id);
+      else expandedEventSources.delete(source.id);
+      if (!events.open || events.dataset.loaded) return;
+      try {
+        const data = await get("/api/source/events?source_id=" + source.id);
+        for (const entry of data.events) {
+          events.appendChild(element("div", "event-line",
+            entry.created_at + " · " + entry.action + " · " + entry.note));
+        }
+        if (!data.events.length) events.appendChild(element("div", "event-line", "尚无操作历史"));
+        events.dataset.loaded = "1";
+      } catch (error) { events.appendChild(element("div", "event-line", error.message)); }
+    });
+    if (expandedEventSources.has(source.id)) events.open = true;
+    row.appendChild(events);
     target.appendChild(row);
   }
 }
@@ -143,9 +183,11 @@ async function showFolders(source) {
   const summary = $("index-summary");
   summary.textContent = source.path + " · " + source.indexed_folders + " 个目录 · " +
     source.indexed_files + " 个媒体 · 云端人工核验 " + source.cloud_verified;
+  if (!$("index-details").open) return;
   target.replaceChildren(element("div", "empty", "读取 SQLite 目录索引中…"));
   try {
-    const result = await get("/api/folders?source_id=" + encodeURIComponent(source.id));
+    const result = await get("/api/folders?source_id=" + encodeURIComponent(source.id)
+      + (showHiddenRecords ? "&include_hidden=1" : ""));
     clear(target);
     if (!result.folders.length) {
       target.appendChild(element("div", "empty", "此来源尚未建立目录索引。重新连接硬盘后执行扫描即可。"));
@@ -276,21 +318,28 @@ function renderPagination(result) {
 
 async function refresh() {
   try {
-    const status = await get("/api/status");
+    const status = await get("/api/status" + (showHiddenRecords ? "?include_hidden=1" : ""));
     csrf = status.csrf;
     currentStatus = status;
     renderCounts(status.counts);
     renderSources(status.sources);
     renderJobFilters(status.sources);
-    const params = new URLSearchParams();
-    if ($("job-source-filter").value) params.set("source_id", $("job-source-filter").value);
-    if ($("job-kind-filter").value) params.set("kind", $("job-kind-filter").value);
-    if ($("job-status-filter").value) params.set("status", $("job-status-filter").value);
-    params.set("limit", String(pageSize));
-    params.set("offset", String(pageOffset));
-    const tasks = await get("/api/jobs" + (params.size ? "?" + params.toString() : ""));
-    renderJobs(tasks.jobs);
-    renderPagination(tasks);
+    $("show-hidden-btn").textContent = (showHiddenRecords ? "隐藏历史记录" : "显示隐藏记录")
+      + "（" + status.hidden_sources + "）";
+    $("show-hidden-btn").setAttribute("aria-pressed", showHiddenRecords ? "true" : "false");
+    $("stored-history-label").textContent = " SQLite 全库仍保存 " + status.stored_files + " 项媒体历史。";
+    if ($("jobs-details").open) {
+      const params = new URLSearchParams();
+      if ($("job-source-filter").value) params.set("source_id", $("job-source-filter").value);
+      if ($("job-kind-filter").value) params.set("kind", $("job-kind-filter").value);
+      if ($("job-status-filter").value) params.set("status", $("job-status-filter").value);
+      if (showHiddenRecords) params.set("include_hidden", "1");
+      params.set("limit", String(pageSize));
+      params.set("offset", String(pageOffset));
+      const tasks = await get("/api/jobs?" + params.toString());
+      renderJobs(tasks.jobs);
+      renderPagination(tasks);
+    }
     $("monitor-switch").checked = status.monitor_enabled;
     $("upload-switch").checked = status.upload_enabled;
     $("credential-state").textContent = status.credentials_present
@@ -416,6 +465,27 @@ async function addSource() {
 
 document.addEventListener("DOMContentLoaded", () => {
   $("add-btn").addEventListener("click", openDialog);
+  $("show-hidden-btn").addEventListener("click", () => {
+    showHiddenRecords = !showHiddenRecords;
+    pageOffset = 0;
+    if (!showHiddenRecords) {
+      $("index-details").open = false;
+      selectedSourceId = "";
+      $("index-summary").textContent = "目录明细已收起。选择来源并点击“查看索引”可展开。";
+    }
+    refresh();
+  });
+  $("index-details").addEventListener("toggle", () => {
+    if ($("index-details").open && currentStatus?.sources?.length) {
+      const source = currentStatus.sources.find(s => String(s.id) === selectedSourceId)
+        || currentStatus.sources[0];
+      selectedSourceId = String(source.id);
+      showFolders(source);
+    }
+  });
+  $("jobs-details").addEventListener("toggle", () => {
+    if ($("jobs-details").open) refresh();
+  });
   $("close-dialog").addEventListener("click", () => $("source-dialog").close());
   $("cancel-btn").addEventListener("click", () => $("source-dialog").close());
   $("confirm-btn").addEventListener("click", addSource);

@@ -1,6 +1,6 @@
 # GoogleUnlimited / Mac M2 原生 Google Photos 备份试验 — 唯一开发与交接文档
 
-> 最后更新：2026-11-14 00:55 (America/Los_Angeles)
+> 最后更新：2026-11-14 06:40 (America/Los_Angeles)
 > 负责执行节点：NexusDock mac-M2（`node_18eb67f64516bf229adb4927b6e076ff`）
 > 当前恢复任务 ID：`tsk_6c3a5c2675bfaefd`（前期任务 ID 和验收历史见下文）
 > 工作目录：`/Users/samni/Desktop/开发项目/GoogleUnlimited`
@@ -136,7 +136,7 @@ bash google-unlimited.sh help
 - 仅绑定本机 127.0.0.1:8796；浏览器访问 http://127.0.0.1:8796。所有写入 API 需要随机 CSRF 令牌及同源校验，静态页面限制 CSP 和 iframe。
 - 所有账号凭据、SQLite 队列只位于 webui/state/（Git 忽略，目录 700、数据库 600）；不得共用旧 google-unlimited.sh 的 gphotos.db 或 MI3MountMac 的任何目录、数据库或任务状态。
 - 浏览范围仅为用户 HOME 和 /Volumes；隐藏项、符号链接和 MI3MountMac 程序数据目录受限制。用户手动指定文件夹或单文件，添加时触发只读扫描（照片/视频至少 10KB），开启“目录监控”后每 30 秒轮询新文件。
-- 记录 SHA-256 摘要、文件大小及修改时间；无变化则直接跳过重复 hash。跨目录内容相同的项目仅在已有同内容 API 接收成功后才标记 duplicate。目录禁用/移除会暂停队列但不删除源文件。
+- 记录 SHA-256 摘要、文件大小及修改时间；无变化则直接跳过重复 hash。跨目录内容相同的项目仅在已有同内容 API 接收成功后才标记 duplicate。目录禁用会暂停相关队列任务；**“删除显示”只停用来源映射并隐藏页面，原 SQLite 上传队列/状态原样保留**。详见最新 9.6 节。
 - SQLite 任务状态：queued、uploading、retrying、failed、paused、api_accepted、duplicate。失败最多三次指数退避后进入 failed，用户可手动重新入队。重启后队列持久化，但 **监控与上传开关均默认为 OFF**。
 - 显示的总体百分比 = (api_accepted + duplicate) / 已登记任务 × 100；属于本地任务处理率，**不是 Google 云端独立核验百分比**。单文件真实网络字节百分比未获得可靠的 gotohp CLI 来源，因此显示“实际字节比例未知”，不得虚构具体数字。
 - 启用上传的三重条件：启动参数 --allow-real-upload、webui/state/gotohp.config 独立账号凭据文件存在且权限 600、用户在 WebUI 手动打开上传开关；Mac CLI 需符合固定 SHA-256。启动时默认 OFF，避免恢复过程突然上传。
@@ -196,6 +196,24 @@ bash google-unlimited.sh help
 **2026-11-14 00:51 本机最终验收：** macOS Python 17 项单测全部 PASS；Python 编译、Node.js JS 语法和 `git diff --check` 均通过。服务仅通过验证过的自身 PID 进行重启；`127.0.0.1:8796` 返回 HTTP 200，`/api/status` 586 条历史任务、来源 ID 1 归档禁用；`/api/jobs?limit=100&offset=100` 返回 100/586，`/api/jobs?source_id=1&kind=video&limit=100&offset=300` 返回 20/320；`/api/folders?source_id=1` 返回 9 个目录；`/api/volumes` 返回 200、当前网络共享数 0。新版 HTML 含网络盘入口和分页控件，JS 已加载；监控 OFF / 上传 OFF，没有真实 Google 请求、没有改动 MI3MountMac。GitHub 远端的新版 CI/提交必须另行核验。
 
 **2026-11-14 00:55 GitHub 验收：** 源码提交 `be9f1c795259a7740421ac636c4f6f3eac4547f5` 已非强制推送到 `samni728/GoogleUnlimited` 的 `main`，并通过 GitHub 重新读取 SHA、README/docs 验证。GitHub Actions [43577910219](https://github.com/samni728/GoogleUnlimited/actions/runs/43577910219) 已完成且结论 **success**：Lint & Static Analysis、macOS Regression、Linux Regression、Windows Regression 四组全部通过。该结论仅覆盖软件静态与无凭据回归测试，**未覆盖真实 NAS 的 Finder 授权挂载，也未覆盖任何 Google Photos 实际上传或云端配额核对**。
+
+### 9.6 WebUI 清爽展示、软隐藏与界面移除（2026-11-14）
+
+> 本轮任务：`tsk_054181dd504c42d9`。用户要求来源和历史索引可保留、隐藏或“删除显示”，但 SQLite 里的媒体、目录、SHA-256、上传结果和人工核验状态**永久保留**；重新添加相同的共享目录时自动恢复原来的历史和实际进度。
+
+- **页面默认简洁**：`#index-details`（目录索引）和 `#jobs-details`（媒体任务明细）使用原生 HTML `details`，默认收起；用户点击展开时才展示详细数据，任务详情在收起时不会轮询拉取。首次访问只显示简洁的来源卡片、摘要和状态，不再自动排出九层目录和 100 条文件。
+- **三种显示方式（仅 WebUI 管理状态）**：
+  - 保留 `visible`：来源卡片与其备份统计正常显示。
+  - 隐藏 `hidden`：卡片、对应目录明细和任务从常规界面及界面汇总数字中消失，**监控配置和 SQLite 原任务状态保持不变**。
+  - 删除显示 `removed`：卡片和相应明细从常规页面消失，来源映射标记为停用/归档，**不对 jobs/folder_index 执行 DELETE，不重置成功状态，不删除任何真实文件**；即使历史卡片原本已归档，亦可单独执行。
+- **历史显隐**：`显示隐藏记录` 按钮切换是否查看 `hidden` / `removed` 的来源及其 SQLite 历史；每个来源提供显示操作和可展开的“操作记录”。请求需 `/api/status?include_hidden=1`、`/api/jobs?include_hidden=1`、`/api/folders?include_hidden=1` 才看到隐藏内容；常规 API 不主动返回其目录/任务记录。
+- **数据库增量迁移**：`sources.ui_visibility TEXT DEFAULT 'visible'` 保留旧表所有来源、文件和历史。新增 `source_events` 记录每次添加、隐藏、移除和重新加载的动作及时间戳，避免将“删除显示”误认为已经删除数据库。所有显示操作修改只限 `sources` 显示/映射状态及新审计表，不修改原有 `jobs` 的 `queued` / `paused` / `api_accepted` / 人工核验记录。
+- **重新挂载同一路径**：`POST /api/sources` 的唯一键为解析后的绝对路径，找到既有来源时**沿用原 source_id**，恢复 UI 显示和来源映射，仅写审计记录，不清除原任务状态、不立即重扫或重新 hash 大批文件。后续显式“扫描”或启用监控才检查磁盘变化；新来源保持原有首次扫描逻辑。注意目前只有**同一路径**匹配，不声称网络盘换名/换挂载点后也能自动匹配。
+- **验证**：Python 20 项无 Google 凭据测试（旧 17 项 + 隐藏保留状态、删除显示后重新加载和非法删除请求），同时新增 HTTP CSRF+显示/隐藏过滤回归，实际 Mac 运行验证与 CI 以本节后面的结果为准。
+- **安全**：从不接触现有 MI3MountMac 应用或其数据库；所有账号凭据、SQLite 数据与备份快照继续在本地 `webui/state/` 且被 Git 忽略。Google Photos 云端自动核验/免费配额尚未验证。
+- **2026-11-14 06:43 本机实测**：Mac M2 的 Python 20 项测试全部 PASS；`python3 -m py_compile`、`node --check webui/app.js` 和 `git diff --check` 均通过。修改的只有本项目源码/测试/文档；重启前已由 SQLite 官方备份方法保存 `webui/state/queue.pre-display-visibility-20261114.sqlite3`，不提交 Git。
+- **2026-11-14 06:44 WebUI 真实服务验收**：只重启经 PID+本机端口确认属于 GoogleUnlimited 的 `8796` 服务；`http://127.0.0.1:8796` HTTP 200，首页检查到目录/文件两个 `<details>` 默认关闭、隐藏记录按钮和保留数量提示；`/api/status`、`/api/status?include_hidden=1`、`/api/jobs`、`/api/source/events?source_id=1` 返回有效数据。生产 SQLite 原始历史完全未变：来源 ID 1 `/Volumes/WIN10/photo` 仍显示为已归档（archived=1，enabled=0，ui_visibility=visible），媒体 586、目录 9，`queued=564`、`paused=22`，没有 Google API 成功/云端人工核验记录，监控/上传 OFF。**没有替用户自动点击隐藏/删除。**
+- **后续真实行为**：用户在 WebUI 手动点“隐藏”或“删除显示”，正常页面就不显示该来源/对应明细，按钮“显示隐藏记录”仍可检查并恢复；再重新添加同一挂载路径即复用旧数据库索引和任务状态，不自动重新 hash 整个目录。
 
 ## 10. 之前阶段待办与交接
 

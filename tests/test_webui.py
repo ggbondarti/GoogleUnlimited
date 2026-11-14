@@ -132,7 +132,9 @@ class WebUITest(unittest.TestCase):
         self.assertEqual(self.store.jobs()[0]["status"], "queued")
         self.store._set_source(source_id, remove=True)
         self.assertTrue(self.media1.is_file())
-        self.assertEqual(self.store.jobs()[0]["status"], "paused")
+        self.assertEqual(self.store.jobs()[0]["status"], "queued")  # UI-only removal preserves progress
+        self.assertTrue(self.store.sources()[0]["archived"])
+        self.assertEqual(self.store.sources()[0]["ui_visibility"], "removed")
 
     def test_browse_no_symlink_or_hidden(self):
         self.store.browse(str(self.source))
@@ -166,6 +168,9 @@ class WebUITest(unittest.TestCase):
         self.assertIn(b"GoogleUnlimited", html)
         self.assertIn(b'id="storage-network"', html)
         self.assertIn(b'id="page-next"', html)
+        self.assertIn(b'id="show-hidden-btn"', html)
+        self.assertIn(b'<details id="index-details"', html)
+        self.assertIn(b'<details id="jobs-details"', html)
         status, payload = req("GET", "/api/status")
         self.assertEqual(status, 200)
         token = payload["csrf"]
@@ -221,6 +226,30 @@ class WebUITest(unittest.TestCase):
                         {"X-GU-CSRF": token})
         self.assertEqual(status, 200)
         self.assertEqual(self.store.sources()[0]["id"], source_id)
+        self.assertTrue(self.store.jobs()[0]["cloud_verified_at"])
+        status, _ = req("POST", "/api/source/display",
+                        {"id": source_id, "mode": "hidden"}, {"X-GU-CSRF": token})
+        self.assertEqual(status, 200)
+        status, hidden_status = req("GET", "/api/status")
+        self.assertEqual(status, 200)
+        self.assertEqual(hidden_status["sources"], [])
+        self.assertEqual(hidden_status["hidden_sources"], 1)
+        status, hidden_jobs = req("GET", "/api/jobs")
+        self.assertEqual(status, 200)
+        self.assertEqual(hidden_jobs["total"], 0)
+        status, all_status = req("GET", "/api/status?include_hidden=1")
+        self.assertEqual(status, 200)
+        self.assertEqual(all_status["sources"][0]["id"], source_id)
+        status, all_jobs = req("GET", "/api/jobs?include_hidden=1")
+        self.assertEqual(status, 200)
+        self.assertEqual(all_jobs["total"], 1)
+        status, event_result = req("GET", "/api/source/events?source_id=" + str(source_id))
+        self.assertEqual(status, 200)
+        self.assertIn("hidden", [event["action"] for event in event_result["events"]])
+        status, _ = req("POST", "/api/source/display",
+                        {"id": source_id, "mode": "removed"}, {"X-GU-CSRF": token})
+        self.assertEqual(status, 200)
+        self.assertTrue(self.store.sources()[0]["archived"])
         self.assertTrue(self.store.jobs()[0]["cloud_verified_at"])
         status, _ = req("POST", "/api/upload", {"enabled": True}, {"X-GU-CSRF": token})
         self.assertEqual(status, 400)  # No independent credentials / runtime gate
@@ -420,6 +449,84 @@ class WebUITest(unittest.TestCase):
             # Recovery of metadata alone must not requeue any previously accepted job.
         finally:
             reopened.close()
+
+    def test_hide_shows_clean_ui_without_mutating_upload_history(self):
+        self.store.add_source(str(self.source), "directory")
+        self.wait_for_jobs(2)
+        source_id = self.store.sources()[0]["id"]
+        job_id = self.store.jobs()[0]["id"]
+        with self.store.connection() as con:
+            con.execute("""UPDATE jobs SET status='api_accepted',media_key='TEST_KEY'
+                           WHERE id=?""", (job_id,))
+        self.store.set_cloud_verified(job_id, True)
+        snapshot = [(j["id"], j["digest"], j["status"], j["cloud_verified_at"])
+                    for j in self.store.jobs()]
+        self.store.set_display(source_id, "hidden")
+        self.assertEqual(self.store.sources(include_hidden=False), [])
+        self.assertEqual(self.store.jobs(include_hidden=False), [])
+        self.assertEqual(self.store.jobs_total(include_hidden=False), 0)
+        self.assertEqual(self.store.status(include_hidden=False)["indexed"]["files"], 0)
+        self.assertEqual(self.store.status(include_hidden=False)["hidden_sources"], 1)
+        self.assertEqual(len(self.store.jobs()), 2)
+        self.assertEqual(self.store.sources()[0]["enabled"], 1)  # Hide does not stop monitoring.
+        self.assertEqual(snapshot, [
+            (j["id"], j["digest"], j["status"], j["cloud_verified_at"])
+            for j in self.store.jobs()])
+        self.assertEqual(self.store.source_events(source_id)[0]["action"], "hidden")
+        self.store.set_display(source_id, "visible")
+        self.assertEqual(len(self.store.sources(include_hidden=False)), 1)
+        self.assertEqual(self.store.jobs_total(include_hidden=False), 2)
+
+    def test_remove_display_and_readd_reuses_sqlite_backup_progress(self):
+        self.store.add_source(str(self.source), "directory")
+        self.wait_for_jobs(2)
+        source_id = self.store.sources()[0]["id"]
+        first = self.store.jobs()[0]
+        with self.store.connection() as con:
+            con.execute("""UPDATE jobs SET status='api_accepted',media_key='TEST_KEY'
+                           WHERE id=?""", (first["id"],))
+        self.store.set_cloud_verified(first["id"], True)
+        before = [(j["id"], j["digest"], j["status"], j["cloud_verified_at"],
+                   j["attempts"]) for j in self.store.jobs()]
+        self.store.set_display(source_id, "removed")
+        self.assertEqual(self.store.sources(include_hidden=False), [])
+        self.assertEqual(self.store.jobs_total(include_hidden=False), 0)
+        self.assertTrue(self.store.sources()[0]["archived"])
+        self.assertFalse(self.store.sources()[0]["enabled"])
+        self.assertEqual(self.store.jobs_total(), 2)
+        self.assertEqual(self.store.folders(source_id)[0]["file_count"], 2)
+        with mock.patch.object(self.store, "request_scan") as scan:
+            self.store.add_source(str(self.source), "directory")
+            scan.assert_not_called()  # No expensive rehash or surprise upload.
+        self.assertEqual(self.store.sources()[0]["id"], source_id)
+        self.assertEqual(self.store.sources()[0]["ui_visibility"], "visible")
+        self.assertEqual(self.store.jobs_total(), 2)
+        self.assertEqual(before, [
+            (j["id"], j["digest"], j["status"], j["cloud_verified_at"],
+             j["attempts"]) for j in self.store.jobs()])
+        actions = [e["action"] for e in self.store.source_events(source_id)]
+        self.assertIn("removed", actions)
+        self.assertIn("reload", actions)
+        reopened = Store(self.base / "state", worker=False)
+        try:
+            self.assertEqual(reopened.sources()[0]["id"], source_id)
+            self.assertEqual(reopened.jobs_total(), 2)
+            self.assertEqual(reopened.folders(source_id)[0]["verified_count"], 1)
+            self.assertIn("removed",
+                          [e["action"] for e in reopened.source_events(source_id)])
+        finally:
+            reopened.close()
+
+    def test_invalid_display_action_does_not_delete_data(self):
+        self.store.add_source(str(self.media1), "file")
+        self.wait_for_jobs(1)
+        source_id = self.store.sources()[0]["id"]
+        with self.assertRaises(UserError):
+            self.store.set_display(source_id, "delete_database")
+        with self.assertRaises(UserError):
+            self.store.set_display(999999, "removed")
+        self.assertEqual(len(self.store.jobs()), 1)
+        self.assertTrue(self.media1.exists())
 
 
 if __name__ == "__main__":
