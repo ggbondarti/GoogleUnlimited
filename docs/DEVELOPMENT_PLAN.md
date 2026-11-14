@@ -1,6 +1,6 @@
 # GoogleUnlimited / Mac M2 原生 Google Photos 备份试验 — 唯一开发与交接文档
 
-> 最后更新：2026-11-13 23:23 (America/Los_Angeles)
+> 最后更新：2026-11-13 23:26 (America/Los_Angeles)
 > 负责执行节点：NexusDock mac-M2（`node_18eb67f64516bf229adb4927b6e076ff`）
 > 恢复任务 ID：`tsk_067d6529aa96eb48`
 > 工作目录：`/Users/samni/Desktop/开发项目/GoogleUnlimited`
@@ -123,6 +123,8 @@ bash google-unlimited.sh help
 - **2026-11-13 23:17 - P3 完成**：通过 Homebrew 官方 fswatch formula 安装 `fswatch 1.22.0`，只安装监控依赖，未加载任何 LaunchAgent 或启动监控。
 - **2026-11-13 23:22 - 文档**：README 增加原作者及上游 GitHub 地址、当前变体、精确基线版本、gotohp 引擎链接、使用边界与单一计划入口；独立测试 Google 账号会在将来由用户自行添加，当前不读取、不使用现有小米 3 Cookie。
 - **2026-11-13 23:23 - P4 mock**：新增 `tests/test_mock_upload.sh`；通过覆写 shell 内 `run_gotohp`，全程没有调用真实引擎、没有网络访问，SQLite 使用独立临时目录。实测「进程退出 23 但 JSON 带 mediaKey」不会登记成功、会进入 retry_queue；下一次模拟 exit 0 且返回 mediaKey，会登记到 uploads、清空 retry；再扫描同一文件保持去重。测试 PASS。该结果只说明本地状态逻辑，**不代表 Google 云端或配额已验证**。
+- **2026-11-13 23:24 - 复核**：完整保留上游 44 条历史提交；安全白名单的 9 个离线测试套件分别通过（不运行上游认证/进程终止测试）；`git diff --check` 通过。提交前只暂存 10 个源码、测试、文档文件，无 Cookie、`gotohp.config`、数据库、照片、`.codegraph` 或 Mac 下载的二进制。
+- **2026-11-13 23:26 - GitHub 发布**：本地提交 `6dc381fd79678b68f0bacb9ce828b25c55ecc678` 成功非强制推送至 `https://github.com/samni728/GoogleUnlimited` 的 `main`。通过 GitHub 再次读取远端分支 SHA、README 及本 docs 验证均正常；README 已注明 `https://github.com/shishir0x/GoogleUnlimited` 为原项目。发布内容是**离线测试可用的开发基线**，不是 Google Photos 真实账号上线验收。
 
 ## 9. 当前下一步
 
