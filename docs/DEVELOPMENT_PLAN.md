@@ -1,13 +1,13 @@
 # GoogleUnlimited / Mac M2 原生 Google Photos 备份试验 — 唯一开发与交接文档
 
-> 最后更新：2026-11-14 00:12 (America/Los_Angeles)
+> 最后更新：2026-11-14 00:51 (America/Los_Angeles)
 > 负责执行节点：NexusDock mac-M2（`node_18eb67f64516bf229adb4927b6e076ff`）
-> 恢复任务 ID：`tsk_067d6529aa96eb48`
+> 当前恢复任务 ID：`tsk_6c3a5c2675bfaefd`（前期任务 ID 和验收历史见下文）
 > 工作目录：`/Users/samni/Desktop/开发项目/GoogleUnlimited`
 > 上游仓库：<https://github.com/shishir0x/GoogleUnlimited>
 > 发布目标：<https://github.com/samni728/GoogleUnlimited> （已确认用户仓库空仓，GitHub 有 push 权限）
 > 当前上游基准 commit：`5b7f5387e218a7d407a27e576989cae707319dc6`（2026-11-05 提交）
-> 当前阶段：P0/P1/P2 基线已通过，P3 Mac CLI/监控依赖已验证，P4 mock 状态流转已通过；**未连接 Google 账号、未开展真实上传**。
+> 当前阶段：WebUI 网络共享入口与可恢复 SQLite 媒体索引已实现，本机 17 项测试与 HTTP 验证已通过；**未连接 Google 账号、未开展真实上传，也尚未实测真实 NAS 登录。**
 
 ## 1. 项目目标与边界
 
@@ -171,6 +171,29 @@ bash google-unlimited.sh help
 - **远端 CI 已验收通过**：GitHub Actions https://github.com/samni728/GoogleUnlimited/actions/runs/43574573385 ，对应提交 da8a3b4ed06f27a11e8b42fbb82307f21662349b；静态检查、macOS、Linux 和 Windows 测试全部 success，且 macOS/Linux 已执行新增 Python WebUI 单测。仅表示开发基线通过，不代表真实 Google Photos 上传或免配额通过。
 - 安全说明：上游 CLI 目前没有可靠的单文件传输字节 API，本版本不输出假百分比；任何 API 接收状态也不代表 Google 官方云端独立核验。P5 独立账号真实上传、存储配额和正式生产链路切换仍为后续阶段。
 - 严禁将 webui/state/ 下的队列/账号凭据/PID/log、Python 缓存、测试用户目录内容提交到 GitHub。README 已加入本地启动命令、独立账号授权示例和风险说明。
+
+### 9.5 网络共享挂载与可恢复 SQLite 媒体索引（2026-11-14）
+
+> NexusDock 任务 ID：`tsk_6c3a5c2675bfaefd`。本阶段继续在唯一仓库与本文更新，不新建独立项目或进度副本。
+
+**WebUI 新入口：** 在“添加监控来源”中切换“本机 / 外接硬盘”和“网络共享 / NAS”。`GET /api/volumes` 从 macOS 的挂载表识别 SMBFS、NFS、AFP、WebDAV、SSHFS/MacFUSE 等已挂载网络卷，列出可选择的挂载点。需要连接新的 SMB 共享时，在页面输入不含用户名或密码的 `smb://host/share`，由 `POST /api/share/connect` 请求 Finder 打开并由 macOS 弹窗完成登录；只有刷新挂载卷列表后才允许选择实际挂载成功的路径。Mac M2 本轮实际测试时无已挂载的 SMB/NFS 网络卷（`/api/volumes` 返回 network 0）；**模拟连接测试通过不等于已验证某台真实 NAS 成功挂载。** 本地或网络盘都由 Mac 读取，不映射到小米 3。
+
+**持久化状态结构：**
+
+- `sources`：持久保存来源 ID、目录/单文件、原始路径、本地或网络卷、挂载根目录、可用性、归档状态、是否监控；“移除”现在是 `archived=1` 的逻辑归档，不删除该来源的任务与目录索引。同一来源恢复使用原 ID。
+- `jobs`：按源文件路径登记大小、照片/视频类别、原扩展名、SHA-256、修改/更改时间、首次/最近发现时间、文件可访问性、去重引用、入队/重试/失败/API 接收状态和云端人工核验方法及时间。SQLite 内容不取决于源文件当前是否在线；文件丢失或共享断开只更新可用性，历史上传状态不清零。
+- `folder_index`：按来源 ID + 每个子目录保存汇总（媒体数、照片数、视频数、字节数、API 接收数、人工云端核验数、失败数、不可访问数）。`GET /api/folders?source_id=...` 可直接从数据库展示历史，不必重新读取 80+GB 的文件。
+- `/api/jobs`：支持来源、照片/视频、任务状态过滤及 `limit/offset` 分页，WebUI 每页 100 项；不再只能查看最早限制的部分数据。云端“人工已核验”只能由用户先去 Google Photos 官方页面核对后手动标记，不能冒充 Google 官方自动核验或无限容量。
+- 服务启动时 `uploading` 的任务变为 `interrupted`（结果未知，待人工核对后可重新入队），**不会自动重复上传**。监控和上传开关始终默认 OFF；网络盘离线时任务与文件摘要继续保存在本机数据库，并被排除自动上传。再次挂载后需要扫描才更新文件可用性。
+- 测试与状态库在 `webui/state/`（已 Git 忽略）；禁止将 SQLite、共享密码、Google 账号 Cookie、照片或日志提交 GitHub。任何时候“移除来源”均不删除真实照片。
+
+**发现并修复的旧数据问题：** 实际 Mac M2 的 `webui/state/queue.sqlite3` 最初有 586 个媒体任务，但 `sources` 表为 0 行，是旧版直接删除来源造成的孤立任务。按历史媒体路径共同前缀恢复了来源 ID 1：`/Volumes/WIN10/photo`，**归档且禁用**；恢复后共 9 个目录、586 个任务（266 张照片、320 段视频），总索引 84,966,018,121 字节（约 84.97 GB），其中 564 项 queued、22 项 paused、0 项 API 接收、0 项人工云端核验。数据库迁移前通过 SQLite 官方备份接口保存一份本地回滚快照 `webui/state/queue.pre-orphan-recovery.sqlite3`。**恢复只修改元数据，没有启动监控、上传或重新扫描这 84.97 GB 文件**，与 MI3MountMac 完全隔离。
+
+**验证范围：** Python WebUI 回归从原有 9 项扩展到 17 项，已通过旧 SQLite schema 迁移、删除来源后的孤立任务恢复、断线/重连、图片与视频目录索引、服务中断后禁止盲重传、人工云端核验、路径保护、网络卷解析和拒绝带凭据的 SMB URL。HTTP 路径和分页的最终部署验证、GitHub 推送及 CI 以本节后续补充的时间戳记录为准。CodeGraph MCP 在该时段连接失败，因此 Bash/Python/JS 变更由直接源码读取、静态检查和可重复运行的测试核验。
+
+**后续真实 NAS 验收：** 将某个 SMB/NFS 远程目录挂载到 Mac 的 `/Volumes/...`，核对目录、图片/视频数量、断线/重连后的索引保持情况；只用另一个独立 Google 账号测试少量非隐私样本的真实上传，并在官方 Google Photos 页面及配额中核对，不能预设真实账号无限容量。
+
+**2026-11-14 00:51 本机最终验收：** macOS Python 17 项单测全部 PASS；Python 编译、Node.js JS 语法和 `git diff --check` 均通过。服务仅通过验证过的自身 PID 进行重启；`127.0.0.1:8796` 返回 HTTP 200，`/api/status` 586 条历史任务、来源 ID 1 归档禁用；`/api/jobs?limit=100&offset=100` 返回 100/586，`/api/jobs?source_id=1&kind=video&limit=100&offset=300` 返回 20/320；`/api/folders?source_id=1` 返回 9 个目录；`/api/volumes` 返回 200、当前网络共享数 0。新版 HTML 含网络盘入口和分页控件，JS 已加载；监控 OFF / 上传 OFF，没有真实 Google 请求、没有改动 MI3MountMac。GitHub 远端的新版 CI/提交必须另行核验。
 
 ## 10. 之前阶段待办与交接
 

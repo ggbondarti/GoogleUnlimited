@@ -14,6 +14,7 @@ import re
 import secrets
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from urllib.parse import parse_qs, urlsplit
@@ -22,6 +23,8 @@ ROOT = Path(__file__).resolve().parent.parent
 STATIC = Path(__file__).resolve().parent
 DEFAULT_STATE = STATIC / "state"
 MEDIA = frozenset(("jpg jpeg png heic heif webp gif bmp tiff tif avif dng raw cr2 cr3 nef arw orf rw2 pef srw raf mp4 mov mkv avi m4v 3gp 3g2 wmv webm mpg mpeg mts m2ts ts flv vob").split())
+VIDEO_EXTS = frozenset("mp4 mov mkv avi m4v 3gp 3g2 wmv webm mpg mpeg mts m2ts ts flv vob".split())
+IMAGE_EXTS = MEDIA - VIDEO_EXTS
 MIN_SIZE = 10240
 MAX_SCAN_FILES = 10000
 MAX_REQUEST_BYTES = 16384
@@ -59,12 +62,21 @@ class Store:
         self.monitor_enabled = False  # NEVER watch or import user's folders by default
         self.lock = threading.RLock()
         self.scan_lock = threading.Lock()
+        self.scan_request_lock = threading.Lock()
+        self.scan_pending = False
+        self.scan_thread_running = False
+        self.scan_thread = None
         self.scan_running = False
         self.last_scan = None
         self.last_scan_error = None
         self.stop_event = threading.Event()
         self.wake_event = threading.Event()
         self._initialize()
+        # Rebuild historical summaries from SQLite alone (no disk or NAS reads).
+        with self.connection() as con:
+            source_ids = [row["id"] for row in con.execute("SELECT id FROM sources")]
+        for source_id in source_ids:
+            self._rebuild_folder_index(source_id)
         self.thread = None
         if worker:
             self.thread = threading.Thread(target=self._worker_loop, daemon=True, name="gu-webui-worker")
@@ -90,7 +102,12 @@ class Store:
                 path TEXT NOT NULL UNIQUE,
                 kind TEXT NOT NULL CHECK(kind IN ('directory','file')),
                 enabled INTEGER NOT NULL DEFAULT 1,
-                added_at TEXT NOT NULL
+                added_at TEXT NOT NULL,
+                archived INTEGER NOT NULL DEFAULT 0,
+                location_kind TEXT NOT NULL DEFAULT 'local',
+                mount_root TEXT NOT NULL DEFAULT '',
+                availability TEXT NOT NULL DEFAULT 'unknown',
+                last_checked_at TEXT NOT NULL DEFAULT ''
               );
               CREATE TABLE IF NOT EXISTS jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,6 +117,15 @@ class Store:
                 bytes INTEGER NOT NULL,
                 digest TEXT NOT NULL,
                 mtime_ns INTEGER NOT NULL DEFAULT 0,
+                media_kind TEXT NOT NULL DEFAULT '',
+                extension TEXT NOT NULL DEFAULT '',
+                first_seen_at TEXT NOT NULL DEFAULT '',
+                last_seen_at TEXT NOT NULL DEFAULT '',
+                last_scan_token TEXT NOT NULL DEFAULT '',
+                file_available INTEGER NOT NULL DEFAULT 1,
+                cloud_verified_at TEXT NOT NULL DEFAULT '',
+                cloud_verify_method TEXT NOT NULL DEFAULT '',
+                ctime_ns INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 retry_at REAL NOT NULL DEFAULT 0,
@@ -110,9 +136,91 @@ class Store:
               );
               CREATE INDEX IF NOT EXISTS idx_jobs_work ON jobs(status,retry_at);
               CREATE INDEX IF NOT EXISTS idx_jobs_digest ON jobs(digest,status);
+              CREATE TABLE IF NOT EXISTS folder_index (
+                source_id INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                file_count INTEGER NOT NULL,
+                image_count INTEGER NOT NULL,
+                video_count INTEGER NOT NULL,
+                total_bytes INTEGER NOT NULL,
+                accepted_count INTEGER NOT NULL,
+                verified_count INTEGER NOT NULL,
+                failed_count INTEGER NOT NULL,
+                missing_count INTEGER NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(source_id,path)
+              );
             """)
-            if "mtime_ns" not in {x["name"] for x in con.execute("PRAGMA table_info(jobs)")}:
-                con.execute("ALTER TABLE jobs ADD COLUMN mtime_ns INTEGER NOT NULL DEFAULT 0")
+            source_cols = {
+                "archived": "INTEGER NOT NULL DEFAULT 0",
+                "location_kind": "TEXT NOT NULL DEFAULT 'local'",
+                "mount_root": "TEXT NOT NULL DEFAULT ''",
+                "availability": "TEXT NOT NULL DEFAULT 'unknown'",
+                "last_checked_at": "TEXT NOT NULL DEFAULT ''",
+            }
+            job_cols = {
+                "mtime_ns": "INTEGER NOT NULL DEFAULT 0",
+                "media_kind": "TEXT NOT NULL DEFAULT ''",
+                "extension": "TEXT NOT NULL DEFAULT ''",
+                "first_seen_at": "TEXT NOT NULL DEFAULT ''",
+                "last_seen_at": "TEXT NOT NULL DEFAULT ''",
+                "last_scan_token": "TEXT NOT NULL DEFAULT ''",
+                "file_available": "INTEGER NOT NULL DEFAULT 1",
+                "cloud_verified_at": "TEXT NOT NULL DEFAULT ''",
+                "cloud_verify_method": "TEXT NOT NULL DEFAULT ''",
+                "ctime_ns": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for table, columns in (("sources", source_cols), ("jobs", job_cols)):
+                existing = {r["name"] for r in con.execute(f"PRAGMA table_info({table})")}
+                for column, definition in columns.items():
+                    if column not in existing:
+                        con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            # Migrate pre-WebUI-upgrade jobs in place. Never erase their status.
+            older = con.execute("""SELECT id,name,updated_at FROM jobs
+                                   WHERE media_kind='' OR first_seen_at=''""").fetchall()
+            for job in older:
+                ext = Path(job["name"]).suffix.lstrip(".").lower()
+                kind = "video" if ext in VIDEO_EXTS else "image" if ext in IMAGE_EXTS else "unknown"
+                con.execute("""UPDATE jobs SET media_kind=?,extension=?,
+                               first_seen_at=CASE WHEN first_seen_at='' THEN ? ELSE first_seen_at END,
+                               last_seen_at=CASE WHEN last_seen_at='' THEN ? ELSE last_seen_at END
+                               WHERE id=?""",
+                            (kind, ext, job["updated_at"], job["updated_at"], job["id"]))
+            # Crash after an API request may have already uploaded the file.
+            # Require an explicit human decision before retrying such jobs.
+            con.execute("""UPDATE jobs SET status='interrupted',
+                           error='上次上传进程中断，云端结果未知。请人工核对后决定是否重试',
+                           updated_at=? WHERE status='uploading'""", (now(),))
+            # Old versions physically deleted source rows while retaining jobs.
+            # Restore the *source metadata only* as an archived, disabled source.
+            # This preserves the original source IDs, media ledger and progress
+            # without reading files, re-scanning, or starting any upload.
+            orphans = con.execute("""SELECT DISTINCT j.source_id FROM jobs j
+                        LEFT JOIN sources s ON s.id=j.source_id
+                        WHERE s.id IS NULL ORDER BY j.source_id""").fetchall()
+            for orphan in orphans:
+                source_id = orphan["source_id"]
+                paths = [row["path"] for row in con.execute(
+                    "SELECT path FROM jobs WHERE source_id=?", (source_id,))]
+                if not paths:
+                    continue
+                if len(paths) == 1:
+                    recovered_path = str(Path(paths[0]))
+                    kind = "file"
+                else:
+                    recovered_path = os.path.commonpath(paths)
+                    kind = "directory"
+                try:
+                    con.execute("""INSERT INTO sources
+                           (id,path,kind,enabled,added_at,archived,location_kind,
+                            mount_root,availability,last_checked_at)
+                           VALUES(?,?,?,0,?,1,'local','','archived',?)""",
+                                (source_id, recovered_path, kind, now(), now()))
+                except sqlite3.IntegrityError:
+                    # A collision with another active source must not overwrite
+                    # either source or change historic backup results.
+                    print("WebUI: overlapping legacy source path needs manual review",
+                          flush=True)
         self.db.chmod(0o600)
 
     def _path(self, raw, *, kind=None):
@@ -134,6 +242,74 @@ class Store:
             if not item.is_file() or not self._eligible(item):
                 raise UserError("请选择已存在且至少 10 KB 的照片或视频文件")
         return item
+
+    @staticmethod
+    def _mounted_volumes():
+        """Read macOS mount table only. Never mount volumes or read credentials."""
+        volumes = []
+        if sys.platform != "darwin":
+            return volumes
+        try:
+            result = subprocess.run(["/sbin/mount"], capture_output=True, text=True,
+                                    timeout=5, check=False)
+            if result.returncode:
+                return volumes
+        except (OSError, subprocess.TimeoutExpired):
+            return volumes
+        network_fs = {"smbfs", "nfs", "afpfs", "webdav", "fuse.sshfs", "macfuse"}
+        for line in result.stdout.splitlines():
+            match = re.match(r"^.*? on (.+?) \(([^,)]+)", line)
+            if not match:
+                continue
+            mountpoint = Path(match.group(1))
+            if not mountpoint.is_absolute() or mountpoint.is_symlink():
+                continue
+            fs_type = match.group(2).strip().lower()
+            if not (contained(mountpoint, Path("/Volumes")) or
+                    contained(mountpoint, Path.home())):
+                continue
+            if fs_type not in network_fs:
+                continue
+            volumes.append({"name": mountpoint.name, "path": str(mountpoint),
+                            "fs_type": fs_type, "kind": "network", "mounted": True})
+        return volumes
+
+    def volumes(self):
+        network = self._mounted_volumes()
+        network_paths = {v["path"] for v in network}
+        local = []
+        root = Path("/Volumes")
+        try:
+            for item in root.iterdir():
+                if (item.name.startswith(".") or item.is_symlink() or
+                        str(item) in network_paths or not item.is_dir()):
+                    continue
+                local.append({"name": item.name, "path": str(item),
+                              "fs_type": "local/other", "kind": "local", "mounted": True})
+        except OSError:
+            pass
+        return {"network": network, "local": sorted(local, key=lambda v: v["name"].lower())}
+
+    def connect_share(self, raw):
+        """Ask macOS Finder to mount SMB; macOS owns all authentication dialogs."""
+        if sys.platform != "darwin":
+            raise UserError("连接共享需在 Mac 上运行；Linux 可先在系统中挂载")
+        if not isinstance(raw, str) or len(raw) > 2048:
+            raise UserError("请输入有效的 SMB 共享地址")
+        try:
+            uri = urlsplit(raw.strip())
+            if (uri.scheme.lower() != "smb" or not uri.hostname or uri.username or
+                    uri.password or uri.query or uri.fragment or "@" in uri.netloc):
+                raise UserError("仅支持不含账号密码的 smb://服务器/共享目录 地址")
+        except ValueError as exc:
+            raise UserError("SMB 地址格式不正确") from exc
+        try:
+            subprocess.Popen(["/usr/bin/open", "-a", "Finder", raw.strip()],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, close_fds=True)
+        except OSError as exc:
+            raise UserError("无法请求 Finder 连接共享，请在 Finder 中手动连接服务器") from exc
+        return {"requested": True, "message": "已请求 Finder 连接。请在 macOS 窗口完成授权，然后刷新网络磁盘列表；尚未确认挂载成功"}
 
     @staticmethod
     def _eligible(file):
@@ -174,19 +350,64 @@ class Store:
 
     def sources(self):
         with self.connection() as con:
-            return [dict(r) for r in con.execute("SELECT * FROM sources ORDER BY id DESC")]
+            rows = [dict(r) for r in con.execute("""SELECT s.*,
+                       (SELECT COUNT(*) FROM jobs j WHERE j.source_id=s.id) AS indexed_files,
+                       (SELECT COUNT(*) FROM folder_index f WHERE f.source_id=s.id) AS indexed_folders,
+                       (SELECT COUNT(*) FROM jobs j WHERE j.source_id=s.id AND j.media_kind='image') AS images,
+                       (SELECT COUNT(*) FROM jobs j WHERE j.source_id=s.id AND j.media_kind='video') AS videos,
+                       (SELECT COUNT(*) FROM jobs j WHERE j.source_id=s.id AND j.status='api_accepted') AS api_accepted,
+                       (SELECT COUNT(*) FROM jobs j WHERE j.source_id=s.id AND j.cloud_verified_at!='') AS cloud_verified
+                       FROM sources s ORDER BY s.archived,s.id DESC""")]
+        return rows
 
-    def jobs(self, limit=120):
+    @staticmethod
+    def _jobs_filter(source_id=None, kind=None, status=None):
+        query = " FROM jobs WHERE 1=1"
+        params = []
+        if source_id is not None:
+            query += " AND source_id=?"
+            params.append(int(source_id))
+        if kind in ("image", "video"):
+            query += " AND media_kind=?"
+            params.append(kind)
+        if status in ("queued", "uploading", "retrying", "failed", "interrupted", "paused",
+                      "api_accepted", "duplicate"):
+            query += " AND status=?"
+            params.append(status)
+        return query, params
+
+    def jobs_total(self, source_id=None, kind=None, status=None):
+        clause, params = self._jobs_filter(source_id, kind, status)
         with self.connection() as con:
-            rows = con.execute("""SELECT id,path,name,source_id,bytes,digest,status,attempts,
-                                    retry_at,error,duplicate_of,updated_at
-                                    FROM jobs ORDER BY id DESC LIMIT ?""", (min(500, max(1, int(limit))),))
+            return con.execute("SELECT COUNT(*)" + clause, params).fetchone()[0]
+
+    def jobs(self, limit=120, source_id=None, kind=None, status=None, offset=0):
+        query = """SELECT id,path,name,source_id,bytes,digest,status,attempts,
+                   media_kind,extension,first_seen_at,last_seen_at,
+                   file_available,cloud_verified_at,cloud_verify_method,
+                   retry_at,error,duplicate_of,updated_at"""
+        clause, params = self._jobs_filter(source_id, kind, status)
+        query += clause + " ORDER BY id DESC LIMIT ? OFFSET ?"
+        params.extend((min(500, max(1, int(limit))), min(1000000, max(0, int(offset)))))
+        with self.connection() as con:
+            rows = con.execute(query, params)
             return [dict(row) for row in rows]
+
+    def folders(self, source_id):
+        with self.connection() as con:
+            return [dict(row) for row in con.execute("""SELECT * FROM folder_index
+                       WHERE source_id=? ORDER BY path LIMIT 500""", (int(source_id),))]
 
     def status(self):
         with self.connection() as con:
             rows = con.execute("SELECT status,COUNT(*) n,COALESCE(SUM(bytes),0) size FROM jobs GROUP BY status")
             counts = {r["status"]: {"count": r["n"], "bytes": r["size"]} for r in rows}
+            indexed = con.execute("""SELECT COUNT(*) files,
+                            SUM(CASE WHEN media_kind='image' THEN 1 ELSE 0 END) images,
+                            SUM(CASE WHEN media_kind='video' THEN 1 ELSE 0 END) videos,
+                            SUM(CASE WHEN cloud_verified_at!='' THEN 1 ELSE 0 END) manually_verified,
+                            COALESCE(SUM(bytes),0) bytes
+                            FROM jobs""").fetchone()
         credentials_present = self.credentials.is_file() and self.credentials.stat().st_mode & 0o077 == 0
         cli_present = self.cli.is_file()
         return {"monitor_enabled": self.monitor_enabled, "upload_enabled": self.upload_enabled,
@@ -194,6 +415,8 @@ class Store:
                 "cli_present": cli_present, "scan_running": self.scan_running,
                 "last_scan": self.last_scan, "last_scan_error": self.last_scan_error,
                 "sources": self.sources(), "counts": counts,
+                "indexed": {k: indexed[k] or 0 for k in indexed.keys()},
+                "supported_formats": {"image": sorted(IMAGE_EXTS), "video": sorted(VIDEO_EXTS)},
                 "cloud_verification": "not_available",
                 "progress_source": "API status only; no confirmed byte-level upload %"}
 
@@ -201,24 +424,42 @@ class Store:
         if kind not in ("directory", "file"):
             raise UserError("来源类型无效")
         path = str(self._path(raw, kind=kind))
+        if path in (str(Path.home()), "/Volumes"):
+            raise UserError("请选一个具体文件夹，而不是整个用户目录或磁盘根目录")
+        network_matches = [v for v in self._mounted_volumes()
+                           if contained(Path(path), Path(v["path"]))]
+        matched = max(network_matches, key=lambda v: len(v["path"])) if network_matches else None
         with self.connection() as con:
-            con.execute("""INSERT INTO sources(path,kind,enabled,added_at) VALUES(?,?,1,?)
-                           ON CONFLICT(path) DO UPDATE SET kind=excluded.kind,enabled=1""",
-                        (path, kind, now()))
+            con.execute("""INSERT INTO sources
+                           (path,kind,enabled,added_at,archived,location_kind,mount_root,availability,last_checked_at)
+                           VALUES(?,?,1,?,0,?,?, 'online',?)
+                           ON CONFLICT(path) DO UPDATE SET
+                           kind=excluded.kind,enabled=1,archived=0,
+                           location_kind=excluded.location_kind,mount_root=excluded.mount_root,
+                           availability='online',last_checked_at=excluded.last_checked_at""",
+                        (path, kind, now(), "network" if matched else "local",
+                         matched["path"] if matched else "", now()))
+            source = con.execute("SELECT id FROM sources WHERE path=?", (path,)).fetchone()
+            con.execute("""UPDATE jobs SET status='queued',updated_at=?
+                           WHERE source_id=? AND status='paused'""", (now(), source["id"]))
         self.request_scan()
         return self.sources()
 
     def _set_source(self, source_id, enabled=None, remove=False):
         with self.connection() as con:
-            row = con.execute("SELECT id FROM sources WHERE id=?", (source_id,)).fetchone()
+            row = con.execute("SELECT id,archived FROM sources WHERE id=?", (source_id,)).fetchone()
             if not row:
                 raise UserError("该来源不存在")
             if remove:
-                con.execute("DELETE FROM sources WHERE id=?", (source_id,))
-                # Preserve job history; stop uploading queued work for a removed source.
+                # Archive only: keep source id, indexed folders and all job history.
+                con.execute("""UPDATE sources SET archived=1,enabled=0,
+                               availability='archived',last_checked_at=? WHERE id=?""",
+                            (now(), source_id))
                 con.execute("""UPDATE jobs SET status='paused',updated_at=?
                                WHERE source_id=? AND status IN ('queued','retrying')""", (now(), source_id))
             else:
+                if row["archived"]:
+                    raise UserError("此来源已归档，请先恢复历史来源")
                 con.execute("UPDATE sources SET enabled=? WHERE id=?", (int(enabled), source_id))
                 if not enabled:
                     con.execute("""UPDATE jobs SET status='paused',updated_at=?
@@ -229,20 +470,56 @@ class Store:
         if enabled:
             self.request_scan()
 
-    def _add_job(self, source_id, file):
+    def restore_source(self, source_id):
+        with self.connection() as con:
+            row = con.execute("SELECT path,kind FROM sources WHERE id=?", (int(source_id),)).fetchone()
+            if not row:
+                raise UserError("历史来源不存在")
+        # Restore saved metadata immediately. Don't hash a huge 80+ GB volume
+        # merely because the user opened its historical index.
+        self._path(row["path"], kind=row["kind"])
+        with self.connection() as con:
+            con.execute("""UPDATE sources SET archived=0,enabled=1,availability='unknown',
+                           last_checked_at=? WHERE id=?""", (now(), source_id))
+            con.execute("""UPDATE jobs SET status='queued',updated_at=?
+                           WHERE source_id=? AND status='paused'""", (now(), source_id))
+        if self.monitor_enabled:
+            self.request_scan()
+        return self.sources()
+
+    def set_cloud_verified(self, job_id, verified):
+        with self.connection() as con:
+            row = con.execute("SELECT status FROM jobs WHERE id=?", (int(job_id),)).fetchone()
+            if not row or row["status"] != "api_accepted":
+                raise UserError("只有 API 已接收的任务可以在人工核对后标记云端确认")
+            con.execute("""UPDATE jobs SET cloud_verified_at=?,cloud_verify_method=?,updated_at=?
+                           WHERE id=?""",
+                        (now() if verified else "", "manual" if verified else "", now(), job_id))
+            source_id = con.execute("SELECT source_id FROM jobs WHERE id=?", (job_id,)).fetchone()[0]
+        self._rebuild_folder_index(source_id)
+
+    def _add_job(self, source_id, file, scan_token=""):
         if not self._eligible(file):
             return
         try:
             before = file.stat()
             size = before.st_size
             mtime_ns = before.st_mtime_ns
+            ctime_ns = before.st_ctime_ns
+            extension = file.suffix.lstrip(".").lower()
+            media_kind = "video" if extension in VIDEO_EXTS else "image"
             with self.connection() as con:
-                cached = con.execute("SELECT bytes,mtime_ns FROM jobs WHERE path=?", (str(file),)).fetchone()
-                if cached and cached["bytes"] == size and cached["mtime_ns"] == mtime_ns:
+                cached = con.execute("SELECT bytes,mtime_ns,ctime_ns FROM jobs WHERE path=?", (str(file),)).fetchone()
+                if (cached and cached["bytes"] == size and cached["mtime_ns"] == mtime_ns
+                        and cached["ctime_ns"] == ctime_ns):
+                    con.execute("""UPDATE jobs SET source_id=?,last_seen_at=?,last_scan_token=?,
+                                   file_available=1,media_kind=?,extension=? WHERE path=?""",
+                                (source_id, now(), scan_token, media_kind, extension, str(file)))
                     return  # Keep recurring scans cheap even with multi-GB media.
             digest = self._digest(file)
             after = file.stat()
-            if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
+            if (before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns
+                    or before.st_ctime_ns != after.st_ctime_ns):
                 return  # Never enqueue an incomplete/changing file.
         except OSError:
             return
@@ -250,56 +527,129 @@ class Store:
         with self.connection() as con:
             previous = con.execute("SELECT id,bytes,digest,status FROM jobs WHERE path=?", (path,)).fetchone()
             if previous and previous["bytes"] == size and previous["digest"] == digest:
+                con.execute("""UPDATE jobs SET source_id=?,mtime_ns=?,ctime_ns=?,media_kind=?,extension=?,
+                               last_seen_at=?,last_scan_token=?,file_available=1 WHERE id=?""",
+                            (source_id, mtime_ns, ctime_ns, media_kind, extension,
+                             now(), scan_token, previous["id"]))
                 return
             accepted = con.execute("""SELECT id FROM jobs WHERE digest=? AND status='api_accepted'
                                       ORDER BY id LIMIT 1""", (digest,)).fetchone()
             state = "duplicate" if accepted else "queued"
             if previous:
-                con.execute("""UPDATE jobs SET source_id=?,name=?,bytes=?,digest=?,mtime_ns=?,status=?,attempts=0,
+                con.execute("""UPDATE jobs SET source_id=?,name=?,bytes=?,digest=?,mtime_ns=?,ctime_ns=?,
+                                media_kind=?,extension=?,last_seen_at=?,last_scan_token=?,file_available=1,
+                                cloud_verified_at='',cloud_verify_method='',status=?,attempts=0,
                                 retry_at=0,error='',media_key='',duplicate_of=?,updated_at=? WHERE id=?""",
-                            (source_id, file.name, size, digest, mtime_ns, state,
+                            (source_id, file.name, size, digest, mtime_ns, ctime_ns, media_kind, extension,
+                             now(), scan_token, state,
                              accepted["id"] if accepted else None, now(), previous["id"]))
             else:
                 con.execute("""INSERT INTO jobs
-                               (path,name,source_id,bytes,digest,mtime_ns,status,duplicate_of,updated_at)
-                               VALUES (?,?,?,?,?,?,?,?,?)""",
-                            (path, file.name, source_id, size, digest, mtime_ns, state,
+                               (path,name,source_id,bytes,digest,mtime_ns,ctime_ns,media_kind,extension,
+                                first_seen_at,last_seen_at,last_scan_token,file_available,
+                                status,duplicate_of,updated_at)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?)""",
+                            (path, file.name, source_id, size, digest, mtime_ns, ctime_ns, media_kind,
+                             extension, now(), now(), scan_token, state,
                              accepted["id"] if accepted else None, now()))
 
+    def _rebuild_folder_index(self, source_id):
+        """Persist per-directory historical counts without accessing source media."""
+        with self.connection() as con:
+            source = con.execute("SELECT path,kind FROM sources WHERE id=?",
+                                 (source_id,)).fetchone()
+            if not source:
+                return
+            root = Path(source["path"]) if source["kind"] == "directory" else Path(source["path"]).parent
+            totals = {}
+            entries = con.execute("""SELECT path,media_kind,bytes,status,cloud_verified_at,
+                                    file_available FROM jobs WHERE source_id=?""", (source_id,))
+            for entry in entries:
+                parent = Path(entry["path"]).parent
+                while contained(parent, root):
+                    if str(parent) not in totals:
+                        totals[str(parent)] = [0] * 8
+                    a = totals[str(parent)]
+                    a[0] += 1
+                    a[1] += int(entry["media_kind"] == "image")
+                    a[2] += int(entry["media_kind"] == "video")
+                    a[3] += entry["bytes"]
+                    a[4] += int(entry["status"] == "api_accepted")
+                    a[5] += int(bool(entry["cloud_verified_at"]))
+                    a[6] += int(entry["status"] in ("failed", "retrying"))
+                    a[7] += int(not entry["file_available"])
+                    if parent == root:
+                        break
+                    parent = parent.parent
+            con.execute("DELETE FROM folder_index WHERE source_id=?", (source_id,))
+            con.executemany("""INSERT INTO folder_index
+                           (source_id,path,file_count,image_count,video_count,total_bytes,
+                            accepted_count,verified_count,failed_count,missing_count,updated_at)
+                            VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                            [(source_id, folder, *values, now()) for folder, values in totals.items()])
+
     def scan(self):
-        if not self.scan_lock.acquire(blocking=False):
-            return False
+        # Explicit scans wait their turn; do not silently skip a disconnected
+        # network share check because another scan happens to be running.
+        self.scan_lock.acquire()
         self.scan_running = True
         self.last_scan_error = None
         try:
             seen = 0
+            mounted = {v["path"] for v in self._mounted_volumes()}
             for source in self.sources():
-                if not source["enabled"]:
+                if not source["enabled"] or source["archived"]:
                     continue
                 path = Path(source["path"])
-                if not path.exists():
-                    self.last_scan_error = "部分来源暂不可用（可能是已卸载的外置磁盘）"
+                source_id = source["id"]
+                remote_offline = (source["location_kind"] == "network" and
+                                  source["mount_root"] not in mounted)
+                if remote_offline or not path.exists():
+                    self.last_scan_error = "部分来源暂不可用（网络共享或外置磁盘已断开），保留历史任务"
+                    with self.connection() as con:
+                        con.execute("""UPDATE sources SET availability='offline',last_checked_at=?
+                                       WHERE id=?""", (now(), source_id))
+                        con.execute("UPDATE jobs SET file_available=0 WHERE source_id=?", (source_id,))
+                    self._rebuild_folder_index(source_id)
                     continue
+                token = secrets.token_hex(12)
+                complete = True
+                def record_error(_error):
+                    nonlocal complete
+                    complete = False
                 if source["kind"] == "file":
-                    self._add_job(source["id"], path)
+                    self._add_job(source_id, path, token)
                     seen += 1
-                    continue
-                for root, dirs, files in os.walk(path, followlinks=False):
-                    dirs[:] = [d for d in dirs if not d.startswith(".")
-                               and not (Path(root) / d).is_symlink()
-                               and not d.endswith((".app", ".photoslibrary"))]
-                    for name in files:
-                        if name.startswith("."):
-                            continue
-                        file = Path(root) / name
-                        if file.suffix.lstrip(".").lower() in MEDIA:
-                            self._add_job(source["id"], file)
-                        seen += 1
+                else:
+                    for root, dirs, files in os.walk(path, followlinks=False, onerror=record_error):
+                        dirs[:] = [d for d in dirs if not d.startswith(".")
+                                   and not (Path(root) / d).is_symlink()
+                                   and not d.endswith((".app", ".photoslibrary"))]
+                        for name in files:
+                            if name.startswith("."):
+                                continue
+                            file = Path(root) / name
+                            if file.suffix.lstrip(".").lower() in MEDIA:
+                                self._add_job(source_id, file, token)
+                            seen += 1
+                            if seen >= MAX_SCAN_FILES:
+                                complete = False
+                                self.last_scan_error = f"扫描上限 {MAX_SCAN_FILES} 项，请缩小监控范围"
+                                break
                         if seen >= MAX_SCAN_FILES:
-                            self.last_scan_error = f"扫描上限 {MAX_SCAN_FILES} 项，请缩小监控范围"
                             break
-                    if seen >= MAX_SCAN_FILES:
-                        break
+                if source["location_kind"] == "network" and source["mount_root"] not in {
+                        v["path"] for v in self._mounted_volumes()}:
+                    complete = False
+                with self.connection() as con:
+                    con.execute("""UPDATE sources SET availability=?,last_checked_at=? WHERE id=?""",
+                                ("online" if complete else "interrupted", now(), source_id))
+                    if complete:
+                        con.execute("""UPDATE jobs SET file_available=0 WHERE source_id=?
+                                       AND last_scan_token!=?""", (source_id, token))
+                if not complete and not self.last_scan_error:
+                    self.last_scan_error = "来源扫描中断，已保留此前索引记录"
+                self._rebuild_folder_index(source_id)
                 if seen >= MAX_SCAN_FILES:
                     break
             self.last_scan = now()
@@ -312,8 +662,27 @@ class Store:
             self.scan_lock.release()
 
     def request_scan(self):
-        if not self.scan_running:
-            threading.Thread(target=self.scan, daemon=True, name="gu-scan").start()
+        with self.scan_request_lock:
+            if self.stop_event.is_set():
+                return
+            self.scan_pending = True
+            if self.scan_thread_running:
+                return
+            self.scan_thread_running = True
+            self.scan_thread = threading.Thread(target=self._scan_runner, daemon=True,
+                                                name="gu-scan")
+            self.scan_thread.start()
+
+    def _scan_runner(self):
+        while not self.stop_event.is_set():
+            with self.scan_request_lock:
+                if not self.scan_pending:
+                    self.scan_thread_running = False
+                    return
+                self.scan_pending = False
+            self.scan()
+        with self.scan_request_lock:
+            self.scan_thread_running = False
 
     def set_monitor(self, enabled):
         self.monitor_enabled = bool(enabled)
@@ -339,8 +708,8 @@ class Store:
     def retry(self, job_id):
         with self.connection() as con:
             row = con.execute("SELECT source_id,status FROM jobs WHERE id=?", (job_id,)).fetchone()
-            if not row or row["status"] not in ("failed", "retrying"):
-                raise UserError("只有失败或等待重试的任务可重新入队")
+            if not row or row["status"] not in ("failed", "retrying", "interrupted"):
+                raise UserError("只有失败、重试或中断待核对的任务可重新入队")
             active = con.execute("SELECT enabled FROM sources WHERE id=?", (row["source_id"],)).fetchone()
             if not active or not active["enabled"]:
                 raise UserError("请先恢复此任务的来源目录")
@@ -352,7 +721,9 @@ class Store:
         with self.connection() as con:
             return con.execute("""SELECT j.* FROM jobs j
                  JOIN sources s ON s.id=j.source_id AND s.enabled=1
-                 WHERE j.status='queued' OR (j.status='retrying' AND j.retry_at<=?)
+                 AND s.archived=0 AND s.availability='online'
+                 WHERE (j.status='queued' OR (j.status='retrying' AND j.retry_at<=?))
+                   AND j.file_available=1
                  ORDER BY j.id ASC LIMIT 1""", (time.time(),)).fetchone()
 
     def _run_upload(self, job):
@@ -388,13 +759,29 @@ class Store:
         if job is None:
             return False
         with self.connection() as con:
+            source = con.execute("SELECT location_kind,mount_root FROM sources WHERE id=?",
+                                 (job["source_id"],)).fetchone()
+        if source and source["location_kind"] == "network" and source["mount_root"] not in {
+                v["path"] for v in self._mounted_volumes()}:
+            with self.connection() as con:
+                con.execute("""UPDATE sources SET availability='offline',last_checked_at=?
+                               WHERE id=?""", (now(), job["source_id"]))
+                con.execute("UPDATE jobs SET file_available=0 WHERE source_id=?", (job["source_id"],))
+            self._rebuild_folder_index(job["source_id"])
+            return False
+        is_duplicate = False
+        with self.connection() as con:
             dupe = con.execute("""SELECT id FROM jobs WHERE digest=? AND status='api_accepted'
                                   AND id!=? LIMIT 1""", (job["digest"], job["id"])).fetchone()
             if dupe:
                 con.execute("UPDATE jobs SET status='duplicate',duplicate_of=?,updated_at=? WHERE id=?",
                             (dupe["id"], now(), job["id"]))
-                return True
-            con.execute("UPDATE jobs SET status='uploading',updated_at=? WHERE id=?", (now(), job["id"]))
+                is_duplicate = True
+            else:
+                con.execute("UPDATE jobs SET status='uploading',updated_at=? WHERE id=?", (now(), job["id"]))
+        if is_duplicate:
+            self._rebuild_folder_index(job["source_id"])
+            return True
         ok, media_key, error = self._run_upload(job)
         with self.connection() as con:
             if ok:
@@ -409,6 +796,7 @@ class Store:
                 retry_at = time.time() + min(3600, 30 * 2 ** attempts)
                 con.execute("""UPDATE jobs SET status=?,attempts=?,retry_at=?,error=?,updated_at=?
                                WHERE id=?""", (status, attempts, retry_at, error, now(), job["id"]))
+        self._rebuild_folder_index(job["source_id"])
         return True
 
     def _worker_loop(self):
@@ -426,8 +814,12 @@ class Store:
     def close(self):
         self.stop_event.set()
         self.wake_event.set()
+        with self.scan_request_lock:
+            self.scan_pending = False
         if self.thread is not None:
             self.thread.join(timeout=3)
+        if self.scan_thread is not None and self.scan_thread.is_alive():
+            self.scan_thread.join(timeout=10)
 
 
 def make_handler(store):
@@ -475,7 +867,27 @@ def make_handler(store):
             if uri.path == "/api/status":
                 return self._json(200, {**store.status(), "csrf": csrf})
             if uri.path == "/api/jobs":
-                return self._json(200, {"jobs": store.jobs()})
+                try:
+                    q = parse_qs(uri.query)
+                    source_id = int(q["source_id"][0]) if "source_id" in q else None
+                    kind = q.get("kind", [None])[0]
+                    status = q.get("status", [None])[0]
+                    limit = min(500, max(1, int(q.get("limit", [120])[0])))
+                    offset = min(1000000, max(0, int(q.get("offset", [0])[0])))
+                    return self._json(200, {"jobs": store.jobs(
+                        limit=limit,offset=offset,source_id=source_id,kind=kind,status=status),
+                        "total": store.jobs_total(source_id=source_id,kind=kind,status=status),
+                        "limit": limit,"offset": offset})
+                except (ValueError, TypeError):
+                    return self._json(400, {"error": "无效的查询参数"})
+            if uri.path == "/api/folders":
+                try:
+                    source_id = int(parse_qs(uri.query)["source_id"][0])
+                    return self._json(200, {"folders": store.folders(source_id)})
+                except (ValueError, KeyError, IndexError):
+                    return self._json(400, {"error": "缺少有效的来源 ID"})
+            if uri.path == "/api/volumes":
+                return self._json(200, store.volumes())
             if uri.path == "/api/browse":
                 try:
                     path = parse_qs(uri.query).get("path", [None])[0]
@@ -508,6 +920,13 @@ def make_handler(store):
                 elif uri == "/api/source/remove":
                     store._set_source(int(payload["id"]), remove=True)
                     result = {"sources": store.sources()}
+                elif uri == "/api/source/restore":
+                    result = {"sources": store.restore_source(int(payload["id"]))}
+                elif uri == "/api/cloud/verify":
+                    store.set_cloud_verified(int(payload["id"]), payload.get("verified") is True)
+                    result = {"jobs": store.jobs()}
+                elif uri == "/api/share/connect":
+                    result = store.connect_share(payload.get("url"))
                 elif uri == "/api/monitor":
                     store.set_monitor(payload.get("enabled") is True)
                     result = {"monitor_enabled": store.monitor_enabled}
