@@ -1,5 +1,31 @@
 # GoogleUnlimited
 
+> **Maintained macOS / Apple Silicon development variant** — [samni728/GoogleUnlimited](https://github.com/samni728/GoogleUnlimited).
+>
+> **Original project / 上游原项目：** [shishir0x/GoogleUnlimited](https://github.com/shishir0x/GoogleUnlimited)
+>
+> **Upstream baseline / 原始版本：** `5b7f5387e218a7d407a27e576989cae707319dc6` (2026-11-05)
+>
+> **Upload engine / 上传引擎：** [xob0t/gotohp](https://github.com/xob0t/gotohp) (separate project)
+>
+> **Development plan & verified progress / 开发进度：** [docs/DEVELOPMENT_PLAN.md](docs/DEVELOPMENT_PLAN.md)
+
+### About this variant / 关于本版本
+
+This repository retains the original project's README, source history and upstream attribution, while adding Mac M2 / ARM64 safeguards and isolated offline diagnostics. Changes include **macOS executable-format validation**, a read-only `audit <directory>` media census, a fix for lost uploader process exit codes, explicit labels for **estimated** rather than Google-confirmed progress, and offline regression coverage.
+
+本版本在原项目基础上开发，原作者及来源见上方链接。重点优化 Mac M2 / Apple Silicon 适配、可验证的备份状态和不影响原有小米 3 Google Photos 备份链路的隔离测试。**本地扫描数和 CLI 上传成功不等于 Google 云端已核验，更不等于 Google 官方承诺无限免费存储。**
+
+Before supplying credentials, check the isolated test instructions in [docs/DEVELOPMENT_PLAN.md](docs/DEVELOPMENT_PLAN.md). Never commit `gotohp.config`, account tokens, Chrome cookies, databases, or personal photos. **A separate test Google account is intended; this repository contains no Google account credentials.** The native gotohp binary is intentionally not committed; it can be obtained from its separately verified upstream release.
+
+Quick offline-only checks (do not sign in or upload):
+
+```bash
+bash google-unlimited.sh audit "/path/to/test-photos"
+bash tests/test_offline_audit.sh
+bash tests/test_macos_binary_selection.sh
+```
+
 > Automated, cross-platform media synchronization utility for Google Photos.  
 > Runs as a lightweight native background watcher on Windows, macOS, and Linux to automatically sync photos and videos using Google Pixel device emulation powered by [`xob0t/gotohp`](https://github.com/xob0t/gotohp) — without virtual machines, Android emulators, Windows Subsystem for Android (WSA), or WSL.
 
@@ -123,7 +149,7 @@ The upload engine communicates directly with Google's mobile upload endpoints us
 
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/shishir0x/GoogleUnlimited.git
+   git clone https://github.com/samni728/GoogleUnlimited.git
    cd GoogleUnlimited
    ```
 2. **Run the setup script**:
@@ -584,7 +610,11 @@ CREATE TABLE logs (
 
 ## Credits and License
 
+- **Original GoogleUnlimited / 原项目作者**: [shishir0x/GoogleUnlimited](https://github.com/shishir0x/GoogleUnlimited), maintained upstream by [shishir0x](https://github.com/shishir0x). This variant preserves the original source history and credits; it is not an official upstream release.
+- **Mac M2 variant / 本分支维护**: [samni728/GoogleUnlimited](https://github.com/samni728/GoogleUnlimited). See [development notes](docs/DEVELOPMENT_PLAN.md) for changes and verification.
 - **Google Photos Engine**: Powered by [`xob0t/gotohp`](https://github.com/xob0t/gotohp) by [xob0t](https://github.com/xob0t) (licensed under the GNU General Public License v3.0).
 - **Windows SQLite Engine**: Powered by [`PSSQLite`](https://github.com/RamblingCookieMonster/PSSQLite) by RamblingCookieMonster (licensed under the Apache License 2.0).
 - **Issues & Contributions**: Report bugs, suggest enhancements, or submit pull requests on GitHub:  
   👉 **[GoogleUnlimited Issue Tracker](https://github.com/shishir0x/GoogleUnlimited/issues)**
+
+**Licensing notice:** The pinned upstream checkout does not include a clearly identifiable top-level LICENSE file. This variant does not imply a new license grant for upstream source files. Before redistribution outside GitHub's supported repository/fork mechanisms or commercial use, verify authorization with the original author and review bundled third-party licenses.

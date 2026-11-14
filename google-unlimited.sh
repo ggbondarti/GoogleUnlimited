@@ -37,6 +37,38 @@ is_media_file() {
     echo "$ext" | grep -qE "$MEDIA_EXT_REGEX"
 }
 
+# Read-only source-media census. No credentials, SQLite writes, watcher,
+# network call, or upload engine is used. Only the explicitly selected folder
+# is inspected; links to files outside that folder are not followed.
+do_audit() {
+    local target="${1:-}"
+    if [ -z "$target" ] || [ ! -d "$target" ]; then
+        echo "ERROR: audit requires an existing directory path" >&2
+        return 2
+    fi
+
+    local scanned=0 eligible=0 skipped=0 eligible_bytes=0
+    local fpath bytes
+    while IFS= read -r -d '' fpath; do
+        scanned=$((scanned + 1))
+        if [ "$OS" = "Darwin" ]; then
+            bytes="$(stat -f '%z' "$fpath" 2>/dev/null)" || bytes=0
+        else
+            bytes="$(stat -c '%s' "$fpath" 2>/dev/null)" || bytes=0
+        fi
+        case "$bytes" in ''|*[!0-9]*) bytes=0 ;; esac
+        if [ "$bytes" -ge 10240 ] && is_media_file "$fpath"; then
+            eligible=$((eligible + 1))
+            eligible_bytes=$((eligible_bytes + bytes))
+        else
+            skipped=$((skipped + 1))
+        fi
+    done < <(find "$target" -type f -print0)
+
+    printf 'mode=offline_audit\npath=%s\nfiles_scanned=%d\nmedia_eligible=%d\nmedia_bytes=%d\nskipped=%d\n' \
+        "$target" "$scanned" "$eligible" "$eligible_bytes" "$skipped"
+}
+
 # Expand shell-style environment variables in a watch_dirs.txt entry without
 # using eval (which would execute command substitutions or other shell syntax).
 # Supports $VAR, ${VAR}, ~, and ~/... while leaving unknown variables literal.
@@ -251,6 +283,22 @@ do_verify() {
 # ---------------------------------------------------------------------
 # BINARY & CONFIG DISCOVERY
 # ---------------------------------------------------------------------
+# On macOS the repository contains Windows/Linux executables by default.
+# Do not accidentally select them through the generic fallback glob.
+is_compatible_gotohp_bin() {
+    local candidate="$1"
+    [ -s "$candidate" ] || return 1
+    if [ "$OS" != "Darwin" ]; then
+        return 0
+    fi
+    local kind
+    kind="$(file -b "$candidate" 2>/dev/null)" || return 1
+    case "$(uname -m)" in
+        arm64) [[ "$kind" == *Mach-O* && ( "$kind" == *arm64* || "$kind" == *universal* ) ]] ;;
+        *) [[ "$kind" == *Mach-O* ]] ;;
+    esac
+}
+
 get_gotohp_bin() {
     local cands=("$SCRIPT_DIR/gotohp-cli")
     if [ "$OS" = "Darwin" ]; then
@@ -260,7 +308,7 @@ get_gotohp_bin() {
     fi
 
     for cand in "${cands[@]}"; do
-        if [ -s "$cand" ]; then
+        if is_compatible_gotohp_bin "$cand"; then
             chmod +x "$cand" 2>/dev/null || true
             echo "$cand"
             return 0
@@ -269,7 +317,7 @@ get_gotohp_bin() {
 
     # Fallback to any other gotohp-cli binary in SCRIPT_DIR
     for cand in "$SCRIPT_DIR"/gotohp-cli*; do
-        if [ -s "$cand" ] && [ "$cand" != "$SCRIPT_DIR/gotohp.config" ]; then
+        if [ "$cand" != "$SCRIPT_DIR/gotohp.config" ] && is_compatible_gotohp_bin "$cand"; then
             chmod +x "$cand" 2>/dev/null || true
             echo "$cand"
             return 0
@@ -277,8 +325,12 @@ get_gotohp_bin() {
     done
 
     if command -v gotohp-cli >/dev/null 2>&1; then
-        command -v gotohp-cli
-        return 0
+        local global_bin
+        global_bin="$(command -v gotohp-cli)"
+        if is_compatible_gotohp_bin "$global_bin"; then
+            echo "$global_bin"
+            return 0
+        fi
     fi
     echo ""
 }
@@ -1184,6 +1236,10 @@ EOF
 
         local ratio=0.0
         local uploaded_bytes=0
+        # Local process read counters are NOT Google-confirmed uploaded bytes.
+        # On macOS /proc is absent, so progress falls back to elapsed-time
+        # estimation. Always disclose the source of the displayed percentage.
+        local progress_basis="local I/O estimate"
 
         # 1. Primary real-time tracking: Process IO Transfer Counters
         local current_read
@@ -1203,6 +1259,7 @@ EOF
         local c_zero
         c_zero=$(awk -v r="$ratio" 'BEGIN { print (r <= 0.0) ? 1 : 0 }')
         if [ "$c_zero" -eq 1 ]; then
+            progress_basis="time estimate"
             ratio=$(calculate_fallback_ratio "$elapsed" "$est_total_sec")
             uploaded_bytes=$(awk -v tot="$size_bytes" -v r="$ratio" 'BEGIN { printf "%.0f", tot * r }')
         fi
@@ -1236,15 +1293,17 @@ EOF
         fi
 
         if [ -t 1 ]; then
-            printf "\r\033[2K  [%s] %s%% | %s / %s %s (%ss%s)" \
-                "$bar" "$pct" "$curr_formatted" "$total_formatted" "$unit_name" "$elapsed" "$eta_str"
+            printf "\r\033[2K  [%s] %s%% [%s] | ~%s / %s %s (%ss%s)" \
+                "$bar" "$pct" "$progress_basis" "$curr_formatted" "$total_formatted" "$unit_name" "$elapsed" "$eta_str"
         fi
 
         sleep 0.2
     done
 
-    wait "$upload_pid" 2>/dev/null || true
-    local exit_code=$?
+    # Preserve the real CLI exit code. "|| true" made a failed upload appear
+    # to exit 0, which could produce a false success when parsing its output.
+    local exit_code=0
+    wait "$upload_pid" 2>/dev/null || exit_code=$?
     if [ "$timed_out" -eq 1 ]; then
         exit_code=124
     fi
@@ -1754,6 +1813,7 @@ show_help() {
     echo ""
     echo "Commands:"
     echo "  watch             Start live real-time sync watcher (default)"
+    echo "  audit <directory> Scan local eligible media (read-only; no Google login/upload)"
     echo "  status            Check upload count and pending retries"
     echo "  logs              View last 30 sync activity log entries"
     echo "  setup             Install dependencies (fswatch/inotify-tools, sqlite3)"
@@ -1773,6 +1833,10 @@ show_help() {
 main() {
 local CMD="${1:-}"
 case "$CMD" in
+    audit|dry-run)
+        shift || true
+        do_audit "$@"
+        ;;
     watch|--watch|run|--run)
         shift || true
         do_watch "$@"

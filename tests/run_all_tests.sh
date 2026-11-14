@@ -6,6 +6,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEST_FILES=(
+    "test_mock_upload.sh"
+    "test_offline_audit.sh"
+    "test_macos_binary_selection.sh"
     "test_readiness.sh"
     "test_creds.sh"
     "test_dedup.sh"

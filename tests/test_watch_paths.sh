@@ -23,6 +23,9 @@ assert_equal() {
 }
 
 export WATCH_PATH_TEST_ROOT="/tmp/Google Photos"
+# AgentDock/CI shells may not export USER; keep this test independent of
+# interactive shell login environment.
+export USER="${USER:-$(id -un)}"
 assert_equal '\$VAR expansion' \
     "$(expand_watch_path '$WATCH_PATH_TEST_ROOT/Album')" \
     "/tmp/Google Photos/Album"

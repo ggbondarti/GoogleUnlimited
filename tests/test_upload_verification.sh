@@ -63,6 +63,20 @@ out4='{"error": "network failure"}'
 res4="$(evaluate_upload_success 1 "$out4")"
 assert_result "Process with non-zero exit code is NOT marked as success" "$res4" 0
 
+# A failed process must NOT become success even if its output contains a
+# successful mediaKey record from before the failure.
+out5='{"success": true, "mediaKey": "AF1QipN32abcxyz"}'
+res5="$(evaluate_upload_success 23 "$out5")"
+assert_result "Non-zero exit with mediaKey is NOT marked as success" "$res5" 0
+
+# Ensure the real watcher retains the upload process exit code too.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if grep -Fq 'wait "$upload_pid" 2>/dev/null || exit_code=$?' "$REPO_ROOT/google-unlimited.sh"; then
+    assert_result "Watcher preserves failed upload exit code" 1 1
+else
+    assert_result "Watcher preserves failed upload exit code" 0 1
+fi
+
 echo "=========================================================="
 echo "  RESULTS: $PASSED Passed, $FAILED Failed"
 echo "=========================================================="

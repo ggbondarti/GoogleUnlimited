@@ -20,6 +20,8 @@ gotohp.config
 *.bak
 
 # OS Metadata
+.codegraph/
+gotohp-cli-macos-universal
 Thumbs.db
 ehthumbs.db
 Desktop.ini
