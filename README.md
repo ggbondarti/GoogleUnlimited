@@ -26,6 +26,32 @@ bash tests/test_offline_audit.sh
 bash tests/test_macos_binary_selection.sh
 ```
 
+### Mac M2 Local WebUI / 本地网页管理
+
+The independent local dashboard resides in webui/, using Python 3 standard library only. It does not mount Android/DCIM and does not read or modify MI3MountMac. It binds exclusively to 127.0.0.1 and both monitoring and upload begin OFF.
+
+Start on the Mac M2:
+
+    cd "/Users/samni/Desktop/开发项目/GoogleUnlimited"
+    python3 webui/server.py --port 8796
+
+Open **http://127.0.0.1:8796** in a browser on the same Mac. Click **＋ 添加来源** to browse local folders, mounted /Volumes drives, or individual media files. Adding a source only scans and queues eligible media; the separate monitor toggle discovers later changes every 30 seconds. The UI provides pause/resume, removing monitoring records (without deleting files), local queue state, SHA-256 content deduplication, failure/retry counts, manual retries and status refresh.
+
+**Real uploads are disabled by default.** When ready to test with an independently authorized Google account (NOT the Xiaomi 3 account), use a dedicated credential file in webui/state/gotohp.config and explicitly enable the runtime gate. Example local commands (never paste cookies into chat or GitHub):
+
+    chmod 700 gotohp-cli-macos-universal
+    ./gotohp-cli-macos-universal --config "$(pwd)/webui/state/gotohp.config" creds add
+    chmod 600 webui/state/gotohp.config
+    python3 webui/server.py --port 8796 --allow-real-upload
+
+The Google login step is user-driven. The runtime pins the gotohp v0.11.0 macOS CLI SHA-256; uploads request Storage Saver quality, never delete the source and require the UI switch to be manually enabled. A mediaKey/CLI success is displayed as **API accepted, NOT cloud-verified**; actual quota must be verified separately. File-level transfer percentage remains unknown if the CLI lacks reliable byte counters. The queue percentage is **API accepted plus deduplicated / locally registered items**, not a Google cloud backup percentage.
+
+State and separate account credentials remain under the gitignored webui/state/ directory. Do not expose this localhost-only service through a public proxy without additional authentication. Local tests do not require Google credentials:
+
+    python3 -m unittest discover -s tests -p test_webui.py -v
+
+Architecture and work records: [docs/DEVELOPMENT_PLAN.md](docs/DEVELOPMENT_PLAN.md).
+
 > Automated, cross-platform media synchronization utility for Google Photos.  
 > Runs as a lightweight native background watcher on Windows, macOS, and Linux to automatically sync photos and videos using Google Pixel device emulation powered by [`xob0t/gotohp`](https://github.com/xob0t/gotohp) — without virtual machines, Android emulators, Windows Subsystem for Android (WSA), or WSL.
 

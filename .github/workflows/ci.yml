@@ -68,6 +68,9 @@ jobs:
       - name: Run All Linux Tests
         run: ./tests/run_all_tests.sh
 
+      - name: Run Independent WebUI Tests (no Google credentials)
+        run: python3 -m unittest discover -s tests -p 'test_webui.py' -v
+
   test-windows:
     name: Windows Regression Tests (PowerShell)
     runs-on: windows-latest
@@ -98,6 +101,9 @@ jobs:
           ./tests/test_dedup.sh
           ./tests/test_permissions.sh
           ./tests/test_watch_paths.sh
+
+      - name: Run Local WebUI Tests (no Google credentials)
+        run: python3 -m unittest discover -s tests -p 'test_webui.py' -v
 
       - name: Validate LaunchAgent Plist Configuration (REL-01)
         run: |

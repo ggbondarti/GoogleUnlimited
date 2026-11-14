@@ -30,3 +30,9 @@ $RECYCLE.BIN/
 
 # IDE Settings
 .vscode/
+
+# Independent, private local WebUI data and Python runtime cache
+webui/state/
+__pycache__/
+*.pyc
+.pytest_cache/

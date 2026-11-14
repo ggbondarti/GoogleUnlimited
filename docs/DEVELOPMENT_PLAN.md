@@ -126,7 +126,54 @@ bash google-unlimited.sh help
 - **2026-11-13 23:24 - 复核**：完整保留上游 44 条历史提交；安全白名单的 9 个离线测试套件分别通过（不运行上游认证/进程终止测试）；`git diff --check` 通过。提交前只暂存 10 个源码、测试、文档文件，无 Cookie、`gotohp.config`、数据库、照片、`.codegraph` 或 Mac 下载的二进制。
 - **2026-11-13 23:26 - GitHub 发布**：本地提交 `6dc381fd79678b68f0bacb9ce828b25c55ecc678` 成功非强制推送至 `https://github.com/samni728/GoogleUnlimited` 的 `main`。通过 GitHub 再次读取远端分支 SHA、README 及本 docs 验证均正常；README 已注明 `https://github.com/shishir0x/GoogleUnlimited` 为原项目。发布内容是**离线测试可用的开发基线**，不是 Google Photos 真实账号上线验收。
 
-## 9. 当前下一步
+## 9. 独立 WebUI：2026-11-14 首期开发
+
+> 当前阶段：已实现并完成 9 项 Python 无凭据测试；本机 127.0.0.1 HTTP 验证和 GitHub CI 结果以最新验收记录为准。本节是后续接手 WebUI 工作的主入口。
+
+### 9.1 设计与访问范围
+
+- 技术栈：Python 3 标准库 + SQLite + 原生 HTML/CSS/JS；无新的外部 Python 依赖。入口 webui/server.py，前端 webui/index.html、webui/style.css、webui/app.js；测试 tests/test_webui.py。
+- 仅绑定本机 127.0.0.1:8796；浏览器访问 http://127.0.0.1:8796。所有写入 API 需要随机 CSRF 令牌及同源校验，静态页面限制 CSP 和 iframe。
+- 所有账号凭据、SQLite 队列只位于 webui/state/（Git 忽略，目录 700、数据库 600）；不得共用旧 google-unlimited.sh 的 gphotos.db 或 MI3MountMac 的任何目录、数据库或任务状态。
+- 浏览范围仅为用户 HOME 和 /Volumes；隐藏项、符号链接和 MI3MountMac 程序数据目录受限制。用户手动指定文件夹或单文件，添加时触发只读扫描（照片/视频至少 10KB），开启“目录监控”后每 30 秒轮询新文件。
+- 记录 SHA-256 摘要、文件大小及修改时间；无变化则直接跳过重复 hash。跨目录内容相同的项目仅在已有同内容 API 接收成功后才标记 duplicate。目录禁用/移除会暂停队列但不删除源文件。
+- SQLite 任务状态：queued、uploading、retrying、failed、paused、api_accepted、duplicate。失败最多三次指数退避后进入 failed，用户可手动重新入队。重启后队列持久化，但 **监控与上传开关均默认为 OFF**。
+- 显示的总体百分比 = (api_accepted + duplicate) / 已登记任务 × 100；属于本地任务处理率，**不是 Google 云端独立核验百分比**。单文件真实网络字节百分比未获得可靠的 gotohp CLI 来源，因此显示“实际字节比例未知”，不得虚构具体数字。
+- 启用上传的三重条件：启动参数 --allow-real-upload、webui/state/gotohp.config 独立账号凭据文件存在且权限 600、用户在 WebUI 手动打开上传开关；Mac CLI 需符合固定 SHA-256。启动时默认 OFF，避免恢复过程突然上传。
+- 真正上传使用 gotohp --saver（Storage Saver），不传 --delete、--force。只有 CLI 成功返回 mediaKey，才登记 api_accepted。尚无自动官方云端二次验证、配额核对，也没有证据表明无限容量政策得到服务器支持。
+- 单次目录扫描限制 10,000 个文件，避免误选 HOME 根目录而无限扫描。对大量外接媒体继续优化性能、目录树浏览和精细网络进度。
+- 运行进程和 webui/state/ 都与 Xiaomi 3 现有备份服务隔离；WebUI 没有任何 MI3MountMac 导入或修改代码。
+
+### 9.2 本机启动、离线验收
+
+在本项目目录：
+
+    python3 webui/server.py --port 8796
+    python3 -m unittest discover -s tests -p test_webui.py -v
+
+只在未来准备测试**另一个** Google 账号时，通过用户自己的 Mac 终端加入 webui/state/gotohp.config，并显式重启 WebUI --allow-real-upload。不得发送 Cookie 到聊天或服务器，不得将账户资料提交到 GitHub。正式批量使用前先选 1–3 张测试图，核对 Google Photos 实际出现及账号存储变化。浏览器上点击监控或扫描绝不代表已授权上传。
+
+### 9.3 预期验收与未完成项
+
+- 已有本机自动测试覆盖：默认双开关关闭、目录/单文件、文件修改、同内容去重、失败→重试、暂停/移除不删除源文件、无凭据重启保留队列、浏览范围与隐藏文件、HTTP 同源 CSRF。
+- 需要真实账号后才能验证：Gotohp 通过独立账号上传、网络吞吐、API 接收→Google Photos 官方页面独立核验、配额前后变化；不能用 mock 状态替代。
+- WebUI 当前以本机目录树选择为主，不是把 Android、NAS 映射为新文件系统。外接盘必须先在 Mac 挂载。
+- 若需要让远端其它设备访问，必须先增加身份鉴权与 HTTPS，并审计安全后才允许代理；本版本禁止把 127.0.0.1 服务直接公开。
+- 后续如要与 MI3MountMac UI 合并，应另设计可撤回的适配器、独立 DB 与来源标记，不得直接共用原有批次状态。
+
+### 9.4 本轮实现与实际验收记录
+
+- 本轮开发任务 ID：tsk_9cf6278b7075ed34。目标仓库 samni728/GoogleUnlimited，现有小米 3/MI3MountMac 服务未操作。
+- 已实现 Python 本地 API/SQLite 后端、浏览器目录/单文件选择、目录监控开关、独立上传开关、扫描与 SHA-256 去重、修改时间缓存、失败最多 3 次指数退避重试、任务列表和总处理率、来源暂停/移除不删真实文件。
+- Python 自动测试通过 9/9，覆盖文件夹、单文件、内容修改、跨目录同内容去重、重试恢复、服务重启持久化、来源暂停删除、路径保护、HTTP/CSRF、无账号拒绝上传。
+- Mac 端 8787 端口已被现有服务占用且返回 401；不强行关闭它，也不复用端口，改用独立 127.0.0.1:8796。
+- 已在 Mac M2 使用默认安全配置启动本机 WebUI，直接 HTTP 实测 /、/app.js、/style.css、/api/status、/api/jobs、/api/browse 均返回 200。WebUI 监控 OFF、上传 OFF、无来源；独立 WebUI 服务在 webui/state/server.pid 内记录进程号。服务默认仅本机可访问，不自动后台永久托管。
+- CI 中已安排 Linux 和 macOS 运行 Python WebUI 测试；GitHub CI 结果需在推送后独立核验，不能用本机结果冒充远端验收。
+- 安全说明：上游 CLI 目前没有可靠的单文件传输字节 API，本版本不输出假百分比；任何 API 接收状态也不代表 Google 官方云端独立核验。P5 独立账号真实上传、存储配额和正式生产链路切换仍为后续阶段。
+- 严禁将 webui/state/ 下的队列/账号凭据/PID/log、Python 缓存、测试用户目录内容提交到 GitHub。README 已加入本地启动命令、独立账号授权示例和风险说明。
+
+## 10. 之前阶段待办与交接
+
 
 当前已可使用（仅检查**明确指定**的样本文件夹，不上传）：
 
