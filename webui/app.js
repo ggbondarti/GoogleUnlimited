@@ -58,6 +58,19 @@ async function action(url, payload, message = "") {
   }
   await refresh();
 }
+
+function collapseHiddenSourceDetails(sourceId) {
+  // Removing/hiding a source must also clear previously expanded DOM tables.
+  // Otherwise its rows would remain visible until the user reloads the page.
+  if (selectedSourceId === String(sourceId)) {
+    selectedSourceId = "";
+    $("index-details").open = false;
+    $("index-summary").textContent = "目录明细已收起。选择可见来源后按需展开。";
+    $("folders-list").replaceChildren();
+  }
+  $("jobs-details").open = false;
+  $("jobs-body").replaceChildren();
+}
 const statusText = {
   queued: "等待上传", uploading: "正在上传", api_accepted: "API 已接收",
   duplicate: "已去重", retrying: "等待重试", failed: "上传失败",
@@ -141,14 +154,17 @@ function renderSources(sources) {
     if (source.ui_visibility === "visible") {
       const hide = element("button", "btn soft", "隐藏");
       hide.title = "只隐藏页面显示，不改变监控和 SQLite 任务状态";
-      hide.addEventListener("click", () => action(
-        "/api/source/display", {id: source.id, mode: "hidden"},
-        "索引已隐藏，数据库和备份历史完整保留"));
+      hide.addEventListener("click", () => {
+        collapseHiddenSourceDetails(source.id);
+        action("/api/source/display", {id: source.id, mode: "hidden"},
+          "索引已隐藏，数据库和备份历史完整保留");
+      });
       row.appendChild(hide);
       const remove = element("button", "btn warn", "删除显示");
       remove.title = "移除本页映射并停止来源监控；不删除数据库及照片";
       remove.addEventListener("click", () => {
         if (confirm("只从 WebUI 删除显示并停止这条来源映射；不删除 SQLite 历史、上传进度或任何照片。确定吗？")) {
+          collapseHiddenSourceDetails(source.id);
           action("/api/source/display", {id: source.id, mode: "removed"},
             "已从界面移除。SQLite 历史仍然保留，重新添加相同目录即可恢复");
         }

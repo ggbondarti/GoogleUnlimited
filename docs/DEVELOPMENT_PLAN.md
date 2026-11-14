@@ -213,7 +213,7 @@ bash google-unlimited.sh help
 - **安全**：从不接触现有 MI3MountMac 应用或其数据库；所有账号凭据、SQLite 数据与备份快照继续在本地 `webui/state/` 且被 Git 忽略。Google Photos 云端自动核验/免费配额尚未验证。
 - **2026-11-14 06:43 本机实测**：Mac M2 的 Python 20 项测试全部 PASS；`python3 -m py_compile`、`node --check webui/app.js` 和 `git diff --check` 均通过。修改的只有本项目源码/测试/文档；重启前已由 SQLite 官方备份方法保存 `webui/state/queue.pre-display-visibility-20261114.sqlite3`，不提交 Git。
 - **2026-11-14 06:44 WebUI 真实服务验收**：只重启经 PID+本机端口确认属于 GoogleUnlimited 的 `8796` 服务；`http://127.0.0.1:8796` HTTP 200，首页检查到目录/文件两个 `<details>` 默认关闭、隐藏记录按钮和保留数量提示；`/api/status`、`/api/status?include_hidden=1`、`/api/jobs`、`/api/source/events?source_id=1` 返回有效数据。生产 SQLite 原始历史完全未变：来源 ID 1 `/Volumes/WIN10/photo` 仍显示为已归档（archived=1，enabled=0，ui_visibility=visible），媒体 586、目录 9，`queued=564`、`paused=22`，没有 Google API 成功/云端人工核验记录，监控/上传 OFF。**没有替用户自动点击隐藏/删除。**
-- **后续真实行为**：用户在 WebUI 手动点“隐藏”或“删除显示”，正常页面就不显示该来源/对应明细，按钮“显示隐藏记录”仍可检查并恢复；再重新添加同一挂载路径即复用旧数据库索引和任务状态，不自动重新 hash 整个目录。
+- **后续真实行为**：用户在 WebUI 手动点“隐藏”或“删除显示”，正常页面就不显示该来源/对应明细，按钮“显示隐藏记录”仍可检查并恢复；再重新添加同一挂载路径即复用旧数据库索引和任务状态，不自动重新 hash 整个目录。已补充浏览器端清理：即使在操作前用户展开过该来源的目录或文件列表，也会立即关闭并清空当前页面的明细 DOM，避免残留显示隐藏来源的数据；SQLite 仍不变。
 
 ## 10. 之前阶段待办与交接
 
