@@ -107,6 +107,10 @@ class WebUITest(unittest.TestCase):
         self.assertNotIn("--force", args)
         # Simulate an explicit one-photo request without using a Google account.
         self.store.allow_upload = True
+        # CI runners don't contain the untracked, locally pinned gotohp binary.
+        # _auth_ready() must pass with an isolated fake CLI, never the real CLI.
+        self.store.cli = self.base / "fake_gotohp_cli"
+        self.store.cli.write_bytes(b"FAKE_CLI_FOR_TEST_ONLY")
         self.store.credentials.write_text("FAKE_TOKEN_NOT_A_CREDENTIAL")
         self.store.credentials.chmod(0o600)
         self.store._run_upload = mock.Mock(return_value=(True, "MOCK_ONE", ""))
