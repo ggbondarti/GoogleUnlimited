@@ -275,6 +275,19 @@ bash google-unlimited.sh help
 
 **后续 WebUI 小修正**：安全状态从三项扩展为四项后，将 `security-grid` 桌面布局调整为两列两行，避免第四项单独落行，并添加无浏览器凭据的前端布局回归断言。该更新只涉及 CSS、测试及这份 docs，不触碰队列/相册/上传路径。
 
+### 9.10 Chrome Profile 8pndk8ba 与小米 3 首次联合预检（2026-11-15）
+
+> 本次用户明确要求使用 Mac M2 本机的 Chrome Profile `8pndk8ba` 与小米 3 完成 Mac 自编译 gotohp 直传验证。联合测试只允许可审核的本机只读验证和凭据已合法准备时的**单张试传**，不能把 Chrome 登录或手机系统备份资格直接当成 Mac CLI 凭据。任务：`tsk_e6fc582279e22990`。
+
+**实际已核验（不读取账号密钥）**：
+
+- **Chrome**：`opencli profile list` 明确报告 `8pndk8ba — connected v1.0.27`（另一个 `e7jvevtb` Profile 单独存在，不混用）；使用 `--profile 8pndk8ba` 在独立浏览器会话打开 `https://photos.google.com/` 成功，标题 `Photos - Google Photos`，页面有账号控件且未显示登录提示。读取该 Profile 的 `https://photos.google.com/quotamanagement`，页面标题 `Manage storage - Google Photos`，显示 **88.8 MB / 15 GB 已用、14.9 GB 剩余**；这是 Chrome 账号的上传前参考基线，不代表小米 3 账号，也不能单靠这一时点证实未来免配额。
+- **Android**：ADB 设备 `bb4b70c` 处于 `device` 状态，小米 3 安装了 `com.google.android.apps.photos`。在 Mac 本机内存中对 Chrome 当前页面控件的邮箱标识与 Android AccountManager 的 `com.google` 账号标识进行**仅相等性比较**：Chrome 找到 1 个账号标识，Android 找到 1 个 Google 系统账号标识，结果 **不匹配**。此次没有把任一邮箱、Cookie、Master Token 或 Android 验证令牌输出到 Agent、日志、文档或聊天。该结果仍需注意 Chrome 网页账号与 Android 系统账号，不必然等于 Photos 应用选中的备份账号；但明确**不能假设两者是同一账户**。
+- **独立 Mac 引擎**：`engine/verify_local_build.py` PASS；GoogleUnlimited WebUI `http://127.0.0.1:8796` 返回 `upload_engine=owned`、`owned_build_verified=true`、`stored_files=586`；`credentials_present=false`、`allow_real_upload=false`、`upload_enabled=false`、`monitor_enabled=false`。目标旅行相册来源 ID 2 的 `album_name=2020@11月行程 南宁武汉贵州长白山` 仍处于 `album_confirmed=0`，没有任何上传状态被改动。
+- **本次真实上传状态**：**没有上传照片**；不能用浏览器现有 Google Web Session 自动代替 gotohp 的非公开 Android 风格凭据，更不能从未匹配的 Android 账号复制长期令牌来“冒充”与 Chrome 账号相同。未经可核验、可撤销的授权以及账号归属匹配，保持批量和单张上传安全阻断。
+
+**后续判定门槛**：用户清醒时先确定 Mac 测试需要使用小米 3 当前 Google Photos 备份账号，还是有意使用 `8pndk8ba` 中的另一个测试账号；如果使用另一账号，不能套用小米 3 那个账号已经确认的零配额经验。只有账号明确且本机安全授权完成后，才能通过 WebUI 人工确认相册并执行 1 张图片的真实上传，再回到对应 Google Photos 官方页面核查相册归属与实际空间增量；全过程不重置现有 586 条任务或改变小米 3、MI3MountMac 备份状态。
+
 ## 10. 之前阶段待办与交接
 
 
