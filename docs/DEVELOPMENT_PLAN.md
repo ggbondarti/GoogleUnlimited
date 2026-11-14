@@ -1,6 +1,6 @@
 # GoogleUnlimited / Mac M2 原生 Google Photos 备份试验 — 唯一开发与交接文档
 
-> 最后更新：2026-11-13 23:26 (America/Los_Angeles)
+> 最后更新：2026-11-14 00:12 (America/Los_Angeles)
 > 负责执行节点：NexusDock mac-M2（`node_18eb67f64516bf229adb4927b6e076ff`）
 > 恢复任务 ID：`tsk_067d6529aa96eb48`
 > 工作目录：`/Users/samni/Desktop/开发项目/GoogleUnlimited`
@@ -168,7 +168,7 @@ bash google-unlimited.sh help
 - Python 自动测试通过 9/9，覆盖文件夹、单文件、内容修改、跨目录同内容去重、重试恢复、服务重启持久化、来源暂停删除、路径保护、HTTP/CSRF、无账号拒绝上传。
 - Mac 端 8787 端口已被现有服务占用且返回 401；不强行关闭它，也不复用端口，改用独立 127.0.0.1:8796。
 - 已在 Mac M2 使用默认安全配置启动本机 WebUI，直接 HTTP 实测 /、/app.js、/style.css、/api/status、/api/jobs、/api/browse 均返回 200。WebUI 监控 OFF、上传 OFF、无来源；独立 WebUI 服务在 webui/state/server.pid 内记录进程号。服务默认仅本机可访问，不自动后台永久托管。
-- CI 中已安排 Linux 和 macOS 运行 Python WebUI 测试；GitHub CI 结果需在推送后独立核验，不能用本机结果冒充远端验收。
+- **远端 CI 已验收通过**：GitHub Actions https://github.com/samni728/GoogleUnlimited/actions/runs/43574573385 ，对应提交 da8a3b4ed06f27a11e8b42fbb82307f21662349b；静态检查、macOS、Linux 和 Windows 测试全部 success，且 macOS/Linux 已执行新增 Python WebUI 单测。仅表示开发基线通过，不代表真实 Google Photos 上传或免配额通过。
 - 安全说明：上游 CLI 目前没有可靠的单文件传输字节 API，本版本不输出假百分比；任何 API 接收状态也不代表 Google 官方云端独立核验。P5 独立账号真实上传、存储配额和正式生产链路切换仍为后续阶段。
 - 严禁将 webui/state/ 下的队列/账号凭据/PID/log、Python 缓存、测试用户目录内容提交到 GitHub。README 已加入本地启动命令、独立账号授权示例和风险说明。
 
