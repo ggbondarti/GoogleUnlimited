@@ -1,6 +1,6 @@
 # GoogleUnlimited / Mac M2 原生 Google Photos 备份试验 — 唯一开发与交接文档
 
-> 最后更新：2026-11-14 06:40 (America/Los_Angeles)
+> 最后更新：2026-11-14 07:36 (America/Los_Angeles)
 > 负责执行节点：NexusDock mac-M2（`node_18eb67f64516bf229adb4927b6e076ff`）
 > 当前恢复任务 ID：`tsk_6c3a5c2675bfaefd`（前期任务 ID 和验收历史见下文）
 > 工作目录：`/Users/samni/Desktop/开发项目/GoogleUnlimited`
@@ -247,7 +247,7 @@ bash google-unlimited.sh help
 
 **指定来源**：WebUI 来源 ID 2，实际路径为 `/Volumes/WIN10/photo/2020@11月行程 南宁武汉贵州长白山 已nas`，在当前 SQLite 中已有 217 条 `queued` 记录，目录可访问。用户拟定云端相册名称为 **`2020@11月行程 南宁武汉贵州长白山`**（不带磁盘目录的“已nas”后缀）。本轮仅预填 SQLite 相册建议，保持 `album_confirmed=0`，等待用户本人在 WebUI 点击确认。项目独立 `gotohp.config` 此前不存在；因此无法执行真实 Google Photos 上传/配额核查，不能谎称已完成第一波云端上传。
 
-**本机实测（2026-11-14）**：Python 24 项测试全部通过（较前次新增 3 项相册相关测试；HTTP/API 验证也覆盖无凭据拒绝试传和确认保存），JS/Python/shell 语法及 `git diff --check` 通过。初始生产 DB 在更改相册设置前使用 SQLite `backup()` 备份到 `webui/state/queue.pre-album-20261114.sqlite3`，不提交 Git。只重启 Mac M2 上经进程名和端口核验的 GoogleUnlimited 8796 服务；现场 HTTP 200，上传/目录监控 OFF，`allow_real_upload=false`，独立凭据文件不存在。针对目标来源 ID 2 预填 `2020@11月行程 南宁武汉贵州长白山`、`album_confirmed=0`，原任务状态严格不变：来源 1 有 369 项 queued，来源 2 有 217 项 queued，合计 586 项；目录和照片均未删除。首个安全单图候选为来源 2 中约 3,763,142 字节的 JPG（仅核对存在和大小，不上传）。第一波“试传 1 张照片”目前**只完成模拟上传测试，真实试传受独立账号授权缺失阻断**；本地 Chrome Profile 登录不能自动替代 gotohp 认证。后续用户本人运行 `bash scripts/authorize_local.sh`，确认正确账号后再使用 WebUI 的相册确认与单张上传按钮。跨平台 GitHub CI 需以最新提交后的远端结果为准。
+**本机实测（2026-11-14）**：Python 24 项测试全部通过（较前次新增 3 项相册相关测试；HTTP/API 验证也覆盖无凭据拒绝试传和确认保存），JS/Python/shell 语法及 `git diff --check` 通过。初始生产 DB 在更改相册设置前使用 SQLite `backup()` 备份到 `webui/state/queue.pre-album-20261114.sqlite3`，不提交 Git。只重启 Mac M2 上经进程名和端口核验的 GoogleUnlimited 8796 服务；现场 HTTP 200，上传/目录监控 OFF，`allow_real_upload=false`，独立凭据文件不存在。针对目标来源 ID 2 预填 `2020@11月行程 南宁武汉贵州长白山`、`album_confirmed=0`，原任务状态严格不变：来源 1 有 369 项 queued，来源 2 有 217 项 queued，合计 586 项；目录和照片均未删除。首个安全单图候选为来源 2 中约 3,763,142 字节的 JPG（仅核对存在和大小，不上传）。第一波“试传 1 张照片”目前**只完成模拟上传测试，真实试传受独立账号授权缺失阻断**；本地 Chrome Profile 登录不能自动替代 gotohp 认证。后续用户本人运行 `bash scripts/authorize_local.sh`，确认正确账号后再使用 WebUI 的相册确认与单张上传按钮。跨平台 GitHub CI 最终已验收：源码提交 `c0dba3d` 最初的 Linux/macOS 测试因 Runner 没有本地 gotohp 二进制而触发模拟测试门禁（非真实上传错误）；修正测试改为创建独立假 CLI 文件，生产安全门禁不变。补丁提交 `ae5cb6b8358e710043c81ffd5e094f8bf7ce329e` 已推送主分支，GitHub Actions [43610882190](https://github.com/samni728/GoogleUnlimited/actions/runs/43610882190) 的 Lint、macOS、Linux 和 Windows 四组测试全部 **success**。独立 Google 凭据尚未建立，首批真实上传仍为等待用户本机授权。
 
 ## 10. 之前阶段待办与交接
 
