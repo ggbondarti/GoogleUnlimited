@@ -65,6 +65,8 @@ class WebUITest(unittest.TestCase):
         self.assertIn(".source-entry > .source-meta", css)
         self.assertIn("text-overflow: ellipsis", css)
         self.assertIn("@media (max-width: 1110px)", css)
+        self.assertIn("grid-template-columns:repeat(2,minmax(0,1fr))", css)
+        self.assertIn("engine-state", (base / "index.html").read_text(encoding="utf-8"))
 
     def test_album_default_requires_explicit_confirmation(self):
         self.store.add_source(str(self.source), "directory")
