@@ -3,7 +3,9 @@ import http.client
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
+import subprocess
 import tempfile
 import threading
 import time
@@ -74,6 +76,49 @@ class WebUITest(unittest.TestCase):
         self.assertIn("@media (max-width: 1110px)", css)
         self.assertIn("grid-template-columns:repeat(2,minmax(0,1fr))", css)
         self.assertIn("engine-state", (base / "index.html").read_text(encoding="utf-8"))
+
+    def test_folder_progress_is_compact_and_uses_api_accepted_not_cloud_verified(self):
+        base = Path(__file__).resolve().parents[1] / "webui"
+        js = (base / "app.js").read_text(encoding="utf-8")
+        css = (base / "style.css").read_text(encoding="utf-8")
+        html = (base / "index.html").read_text(encoding="utf-8")
+        for marker in ("folderUploadProgress(", "folder-progress-track",
+                       "folder-upload-percent", "folder.remaining", "folder.verified_count",
+                       'setAttribute("role", "progressbar")', "根目录（含子目录）"):
+            if marker == "folder.remaining":
+                marker = "progress.remaining"
+            self.assertIn(marker, js)
+        self.assertIn(".folder-progress-fill", css)
+        self.assertIn("未接收包括排队、失败及去重", html)
+        if not shutil.which("node"):
+            return  # Static structural guard still runs on Node-less test platforms.
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const start = source.indexOf("function folderUploadProgress(");
+const end = source.indexOf("\nasync function showFolders(", start);
+assert(start >= 0 && end > start);
+const calc = new Function(source.slice(start, end) + "\nreturn folderUploadProgress;")();
+assert.deepStrictEqual(calc(66, 217), {
+  total:217, accepted:66, remaining:151, acceptedPercent:30.4, remainingPercent:69.6
+});
+assert.deepStrictEqual(calc(32, 32), {
+  total:32, accepted:32, remaining:0, acceptedPercent:100, remainingPercent:0
+});
+assert.deepStrictEqual(calc(2, 107), {
+  total:107, accepted:2, remaining:105, acceptedPercent:1.9, remainingPercent:98.1
+});
+assert.deepStrictEqual(calc(0, 0), {
+  total:0, accepted:0, remaining:0, acceptedPercent:0, remainingPercent:0
+});
+assert.deepStrictEqual(calc(999, 2), {
+  total:2, accepted:2, remaining:0, acceptedPercent:100, remainingPercent:0
+});
+"""
+        result = subprocess.run(["node", "-e", script, str(base / "app.js")],
+                                capture_output=True, text=True, timeout=15, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_album_defaults_to_folder_name_without_confirmation(self):
         self.store.add_source(str(self.source), "directory")

@@ -153,3 +153,61 @@
     grid-column: 1 / -1;
   }
 }
+
+/* Folder history: compact, glanceable API-accepted progress per subtree. */
+.folder-table { min-width: 760px; }
+.folder-table th:nth-child(1) { width: 27%; }
+.folder-table th:nth-child(2) { width: 18%; }
+.folder-table th:nth-child(3) { width: 27%; }
+.folder-table th:nth-child(4) { width: 15%; }
+.folder-table th:nth-child(5) { width: 13%; }
+.folder-table td { padding: 14px 12px; vertical-align: middle; }
+.folder-table td:first-child { max-width: 290px; }
+.folder-relative-path {
+  display: block;
+  color: #335348;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+  line-height: 1.6;
+}
+.folder-media-cell strong,
+.folder-remaining-cell strong,
+.folder-verified-cell strong {
+  display: block;
+  color: #324b42;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+.folder-media-cell small,
+.folder-remaining-cell small,
+.folder-verified-cell small {
+  display: block;
+  margin-top: 5px;
+  color: #879991;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.folder-upload-cell { min-width: 155px; }
+.folder-upload-label {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 7px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.folder-upload-percent { color: #238255; font-weight: 750; }
+.folder-progress-track {
+  height: 7px;
+  border-radius: 99px;
+  background: #e9efeb;
+  overflow: hidden;
+}
+.folder-progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: #2f9b6c;
+  transition: width .25s ease;
+}
+.folder-missing { color: #a36340 !important; }

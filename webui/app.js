@@ -349,11 +349,28 @@ function renderSources(sources) {
   }
 }
 
+// Folder totals include all descendants. "Remaining" means not yet API-accepted,
+// not "verified in Google Photos", and may include queued/failed/duplicate items.
+function folderUploadProgress(acceptedCount, fileCount) {
+  const total = Number.isFinite(Number(fileCount)) ? Math.max(0, Math.floor(Number(fileCount))) : 0;
+  const accepted = Number.isFinite(Number(acceptedCount)) ?
+    Math.min(total, Math.max(0, Math.floor(Number(acceptedCount)))) : 0;
+  const remaining = total - accepted;
+  const percent = count => total ? Math.round(count * 1000 / total) / 10 : 0;
+  return {total, accepted, remaining, acceptedPercent: percent(accepted),
+          remainingPercent: percent(remaining)};
+}
+
 async function showFolders(source) {
   const target = $("folders-list");
   const summary = $("index-summary");
-  summary.textContent = source.path + " · " + source.indexed_folders + " 个目录 · " +
-    source.indexed_files + " 个媒体 · 云端人工核验 " + source.cloud_verified;
+  const overall = folderUploadProgress(source.api_accepted, source.indexed_files);
+  const sourceName = source.path.replace(/\/$/, "").split("/").pop() || source.path;
+  summary.title = source.path;
+  summary.textContent = sourceName + " · " + source.indexed_folders + " 个目录 · " +
+    "API 已接收 " + overall.accepted + "/" + overall.total + "（" + overall.acceptedPercent +
+    "%）· 未接收 " + overall.remaining + "（" + overall.remainingPercent +
+    "%）· 人工核验 " + source.cloud_verified;
   if (!$("index-details").open) return;
   target.replaceChildren(element("div", "empty", "读取 SQLite 目录索引中…"));
   try {
@@ -367,19 +384,59 @@ async function showFolders(source) {
     const table = element("table", "folder-table");
     const head = element("thead");
     const tr = element("tr");
-    for (const col of ["目录路径", "媒体", "照片", "视频", "API 已接收", "人工云端核验", "离线 / 丢失"]) {
+    for (const col of ["目录", "媒体构成", "上传进度（API 已接收）", "尚未接收", "云端人工核验"]) {
       tr.appendChild(element("th", null, col));
     }
     head.appendChild(tr);
     table.appendChild(head);
     const body = element("tbody");
+    const basePath = source.kind === "file" ?
+      source.path.slice(0, source.path.lastIndexOf("/")) : source.path.replace(/\/$/, "");
     for (const folder of result.folders) {
       const row = element("tr");
-      for (const data of [folder.path, folder.file_count, folder.image_count,
-                          folder.video_count, folder.accepted_count, folder.verified_count,
-                          folder.missing_count]) {
-        row.appendChild(element("td", null, data));
-      }
+      const progress = folderUploadProgress(folder.accepted_count, folder.file_count);
+      const displayPath = folder.path === basePath ? "根目录（含子目录）" :
+        folder.path.startsWith(basePath + "/") ?
+        folder.path.slice(basePath.length + 1) : folder.path;
+      const pathCell = element("td", "folder-path-cell");
+      const pathText = element("span", "folder-relative-path", displayPath);
+      pathText.title = folder.path;
+      pathCell.appendChild(pathText);
+      row.appendChild(pathCell);
+
+      const mediaCell = element("td", "folder-media-cell");
+      mediaCell.appendChild(element("strong", null, progress.total + " 项"));
+      mediaCell.appendChild(element("small", null,
+        "照片 " + folder.image_count + " · 视频 " + folder.video_count));
+      row.appendChild(mediaCell);
+
+      const uploadedCell = element("td", "folder-upload-cell");
+      const topLine = element("div", "folder-upload-label");
+      topLine.appendChild(element("strong", null, progress.accepted + " / " + progress.total));
+      topLine.appendChild(element("span", "folder-upload-percent", progress.acceptedPercent + "%"));
+      uploadedCell.appendChild(topLine);
+      const track = element("div", "folder-progress-track");
+      track.setAttribute("role", "progressbar");
+      track.setAttribute("aria-label", displayPath + " API 已接收比例");
+      track.setAttribute("aria-valuemin", "0");
+      track.setAttribute("aria-valuemax", "100");
+      track.setAttribute("aria-valuenow", String(progress.acceptedPercent));
+      const fill = element("div", "folder-progress-fill");
+      fill.style.width = progress.acceptedPercent + "%";
+      track.appendChild(fill);
+      uploadedCell.appendChild(track);
+      row.appendChild(uploadedCell);
+
+      const remainingCell = element("td", "folder-remaining-cell");
+      remainingCell.appendChild(element("strong", null, progress.remaining + " 项"));
+      remainingCell.appendChild(element("small", null, progress.remainingPercent + "% 未接收"));
+      row.appendChild(remainingCell);
+
+      const verifiedCell = element("td", "folder-verified-cell");
+      verifiedCell.appendChild(element("strong", null, folder.verified_count));
+      if (folder.missing_count) verifiedCell.appendChild(element("small", "folder-missing",
+        "离线 / 丢失 " + folder.missing_count));
+      row.appendChild(verifiedCell);
       body.appendChild(row);
     }
     table.appendChild(body);
