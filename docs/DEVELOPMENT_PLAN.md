@@ -288,6 +288,14 @@ bash google-unlimited.sh help
 
 **后续判定门槛**：用户清醒时先确定 Mac 测试需要使用小米 3 当前 Google Photos 备份账号，还是有意使用 `8pndk8ba` 中的另一个测试账号；如果使用另一账号，不能套用小米 3 那个账号已经确认的零配额经验。只有账号明确且本机安全授权完成后，才能通过 WebUI 人工确认相册并执行 1 张图片的真实上传，再回到对应 Google Photos 官方页面核查相册归属与实际空间增量；全过程不重置现有 586 条任务或改变小米 3、MI3MountMac 备份状态。
 
+### 9.11 独立 Chrome 测试账号：共享配额基线与首次试传阻断（2026-11-14 晚间）
+
+- **用户确认账号用途**：Chrome Profile `8pndk8ba` 是**另一独立 Google 测试账号**，不要求与小米 3 的 Google 系统账号相同；前文 9.10 的“账号不匹配”只是客观比较结果，**不能作为阻止该独立账号试传的理由**。但独立账号的 Mac 上传，也不能直接证明继承小米 3 当前账号的免费备份资格。
+- **纠正用量含义**：Google Photos `/quotamanagement` 显示的 **88.8 MB / 15 GB** 是该 Google 账号的**共享存储总量**（Gmail、Drive、Google Photos 等），**不是 Google Photos 自身已使用 88.8 MB**。用户确认 Google Photos 当前没有照片，因此该 88.8 MB 可能来自其他 Google 服务，具体归属未逐项核对。保留该数据仅用于单张 Mac 上传前后对比，不把它当作相册存量。
+- **已主动完成的现场配置**：用户已经给定固定相册名 `2020@11月行程 南宁武汉贵州长白山`，本次通过本地 Store 的 `set_album(2, ...)` 完成确认，`sources.id=2` 的 `album_confirmed` 已由 0 改为 **1**，且其 **217 条 queued** 任务状态未变；文件未被上传。全局监控、真实上传开关仍为 OFF。
+- **实际授权测试**：Mac M2 自编译 owned 引擎哈希通过，但 `webui/state/gotohp.config` **不存在**。尝试在已连接的 OpenCLI Profile `8pndk8ba` 中加载 Google `EmbeddedSetup` 登录授权页，浏览器 Bridge 的新建标签/页面状态及当前 URL 读取均发生超时，无法取得有效本机 gotohp 授权；**没有提取或输出任何 Cookie、oauth_token 或 Google Master Token**。已登录 Chrome 不等于 gotohp CLI 获得独立访问凭据，因此单张真实上传**没有发生**。不要通过无人值守命令绕过 Google 的重新登录、安全验证或用户同意。
+- **只剩一个真正前置条件**：目标测试账号需在本机完成 Google Embedded Setup 授权，并仅将一次性 `oauth_token` 经**本机 Terminal** 的 `bash scripts/authorize_local.sh` 输入（不要发送给 AI/远程服务器）。确认 `gotohp.config` 建立、账号匹配之后，才以 `--engine owned --allow-real-upload` 启动项目服务（批量仍 OFF）并点击来源 2 的单张试传。最后回到**同一独立账号**的 Google Photos，核对是否显示照片和共享空间是否变化；统计可能延迟。需要有凭据才能继续，不能谎报已完成上传。
+
 ## 10. 之前阶段待办与交接
 
 
