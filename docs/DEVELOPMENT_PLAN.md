@@ -333,6 +333,16 @@ bash google-unlimited.sh help
 - Storage saver 使用 --saver；Original 不带 --saver，但两者都不设置独立的 --use-quota 参数。由于 Google 服务端可能改变上传、画质和计费政策，Original 应先单张测试，核对 Google Photos 官方「详情」以及后续共享配额变化。用户提供的 Storage saver 样例，官方页面标注 doesn't take up space in your account storage，证明这一个媒体不计配额，不证明原画质同样免费。
 - 自动化回归只使用假的本地媒体和模拟 CLI，不上传用户真实文件；本机实例运行期间不得对正在传输的视频强制重启。部署成功与否以实际 HTTP、SQLite 和浏览器状态为准。
 
+### 9.15 Original quality 单张真实试传及安全恢复
+
+本轮首先核对原有 Storage saver 同步状态，暂停领取下一任务，并等当前约 547 MB 视频自然上传完成，确认无 uploading 后生成本地 SQLite 备份（未提交）。新版本 WebUI 已部署至原本机地址，既有 586 条媒体任务以及已人工云端核验字段保持不变；来源的 upload_quality 初始均为 storage_saver。
+
+在自动同步停止状态下，对当前测试来源临时设置 original；通过自编译 gotohp CLI 发起一次单张照片上传（任务 ID 94），耗时约 22 秒，API 返回 api_accepted。Original 模式没有添加 --saver，也没有主动使用 --use-quota。测试前后使用同一个已登录的独立测试账号，Google 官方共享存储页面均显示 88.8 MB / 15 GB。**此结果证明原画质模式的上传 API 请求被接收，不能仅凭配额读数证明该张媒体的官方质量标签或长期免计费。** 本次未能从官方媒体详情页独立验证 Original quality，需要后续在该条目的详情中确认。
+
+测试后立即恢复来源的 storage_saver 画质，重新开启 auto_sync=1（目录监控与批量上传均启用、意愿持久保存）；当时来源 2 共 37 项 api_accepted、180 项 queued，已归档来源 1 的 369 项未动。Chrome Profile、个人文件路径、相册真实名称均未写入公开仓库文档。
+
+固定源码功能提交 7534f1ac3832882b52dec1892853a5ac49007526，另修复一项 Linux 上传进度测试：Linux 页面缓存命中会令 /proc/io read_bytes 统计不足，因此测试改为可持续观测的 rchar 读取量及长寿命测试进程。提交 ff46ab6599e9047267467ced8d9f6d138deb85c8 对应的 GitHub Actions 43690753862 已验证 Linux、macOS、Windows 及 Lint 四组成功；34 项本地 Python 测试通过。
+
 ## 10. 之前阶段待办与交接
 
 
