@@ -124,6 +124,9 @@ function renderSources(sources) {
     info.appendChild(element("small", "source-badges",
       "已发现 " + all + " 项（照片 " + source.images + " / 视频 " + source.videos +
       "） · 已接收 " + uploaded + " / " + all + " · " + pct + "% · 云端核验 " + source.cloud_verified));
+    info.appendChild(element("small", "source-badges",
+      "画质：" + (source.upload_quality === "original" ? "Original quality（原画质）" :
+        "Storage saver（节省空间）")));
     info.appendChild(element("small", "source-album-caption",
       "Google Photos 相册：" + (source.album_name || "尚未设定") +
       (source.album_confirmed ? "" : " · 添加此来源后自动使用该名称")));
@@ -240,6 +243,41 @@ function renderSources(sources) {
       } catch (error) { notice(error.message); }
     });
     albumBody.appendChild(confirmAlbum);
+    const qualityLabel = element("label", "source-quality-label", "后续上传画质");
+    const qualitySelect = element("select", "source-quality-select");
+    for (const choice of [
+      {value: "storage_saver", text: "Storage saver（默认，节省空间）"},
+      {value: "original", text: "Original quality（原始画质）"}
+    ]) {
+      const option = document.createElement("option");
+      option.value = choice.value;
+      option.textContent = choice.text;
+      qualitySelect.appendChild(option);
+    }
+    qualitySelect.value = source.upload_quality || "storage_saver";
+    qualitySelect.disabled = !!currentStatus?.upload_enabled;
+    qualitySelect.title = "先停止自动同步，再修改该来源后续文件的上传画质";
+    qualitySelect.addEventListener("change", async () => {
+      const next = qualitySelect.value;
+      if (next === "original" && !confirm(
+        "原画质可能占用 Google 账号空间。只影响未上传的文件，建议先单张试传核对配额。确认切换吗？")) {
+        qualitySelect.value = source.upload_quality || "storage_saver";
+        return;
+      }
+      qualitySelect.disabled = true;
+      try {
+        await post("/api/source/quality", {id: source.id, quality: next});
+        notice("画质已设置为 " + (next === "original" ? "Original quality" : "Storage saver") +
+          "，只影响未上传的文件。", true);
+        await refresh();
+      } catch (error) {
+        qualitySelect.value = source.upload_quality || "storage_saver";
+        qualitySelect.disabled = false;
+        notice(error.message);
+      }
+    });
+    albumBody.appendChild(qualityLabel);
+    albumBody.appendChild(qualitySelect);
     const test = element("button", "btn soft", "仅试传 1 张照片");
     test.type = "button";
     test.disabled = !source.album_confirmed || !currentStatus?.allow_real_upload
@@ -250,7 +288,9 @@ function renderSources(sources) {
       currentStatus?.upload_enabled ? "请先关闭批量上传开关" : "只上传最小的一张未上传照片";
     test.addEventListener("click", async () => {
       if (!confirm("只从此来源挑选 1 张未上传的照片，使用独立账号上传到相册「" +
-        source.album_name + "」。这会产生真实 Google Photos 网络请求。继续吗？")) return;
+        source.album_name + "」，画质为 " +
+        (source.upload_quality === "original" ? "Original quality（可能占用配额）" : "Storage saver") +
+        "。这会产生真实 Google Photos 网络请求。继续吗？")) return;
       test.disabled = true;
       try {
         const result = await post("/api/source/test-upload", {id: source.id});
@@ -262,7 +302,7 @@ function renderSources(sources) {
     });
     albumBody.appendChild(test);
     albumBody.appendChild(element("small", "source-album-hint",
-      "默认使用文件夹名称，添加后直接同步。需要改名时先停止自动同步；修改名称不会移动已上传照片。"));
+      "默认 Storage saver。先停止自动同步再修改画质；新画质只影响尚未上传的文件，建议先单张测试。"));
     album.appendChild(albumBody);
     album.addEventListener("toggle", () => {
       if (album.open) expandedAlbumSources.add(source.id);

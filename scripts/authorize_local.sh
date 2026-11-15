@@ -17,7 +17,7 @@ if [[ ! -x "$CLI" ]] || ! python3 "$ROOT/engine/verify_local_build.py"; then
 fi
 mkdir -p "$STATE"
 chmod 700 "$STATE"
-echo "本机独立账号授权：请先在你的 Chrome 8pndk8ba 配置文件中访问"
+echo "本机独立账号授权：请先在已登录目标 Google 账号的 Chrome 配置文件中访问"
 echo "https://accounts.google.com/EmbeddedSetup"
 echo "完成 Google 登录并同意。打开 Chrome 开发者工具 > Application > Cookies >"
 echo "https://accounts.google.com，只复制 oauth_token 的 Value。"

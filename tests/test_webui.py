@@ -62,6 +62,8 @@ class WebUITest(unittest.TestCase):
         self.assertIn("grid-template-columns: 42px minmax(0, 1fr) auto", css)
         self.assertIn(".source-album-form", css)
         self.assertIn("source-album-settings", js)
+        self.assertIn("source-quality-select", js)
+        self.assertIn("/api/source/quality", js)
         self.assertIn('"sync-switch"', js)
         self.assertNotIn('"monitor-switch"', js)
         self.assertNotIn('"upload-switch"', js)
@@ -84,10 +86,10 @@ class WebUITest(unittest.TestCase):
             self.store.set_album(source["id"], "\ninvalid")
         with self.assertRaises(UserError):
             self.store.set_album(source["id"], " " * 4)
-        self.store.set_album(source["id"], "2020@11月行程 南宁武汉贵州长白山")
+        self.store.set_album(source["id"], "示例旅行相册")
         self.assertEqual(self.store.sources()[0]["album_confirmed"], 1)
         self.assertEqual(self.store.sources()[0]["album_name"],
-                         "2020@11月行程 南宁武汉贵州长白山")
+                         "示例旅行相册")
         self.assertIsNotNone(self.store._next_job())
         self.assertTrue(any(event["action"] == "album_confirmed"
                             for event in self.store.source_events(source["id"])))
@@ -159,6 +161,44 @@ class WebUITest(unittest.TestCase):
         self.assertEqual(jobs[str(new_file)]["status"], "queued")
         self.assertEqual(self.store.sources()[0]["id"], source_id)
         self.assertEqual(self.store.sources()[0]["album_confirmed"], 1)
+
+    def test_upload_quality_flag_and_history_are_isolated_per_source(self):
+        self.store.add_source(str(self.source), "directory")
+        self.wait_for_jobs(2)
+        source = self.store.sources()[0]
+        source_id = source["id"]
+        self.assertEqual(source["upload_quality"], "storage_saver")
+        job = self.store.jobs()[0]
+        with mock.patch("webui.server.subprocess.run",
+                        return_value=mock.Mock(returncode=0,
+                                               stdout='{"mediaKey":"TEST"}')) as run:
+            ok, _, _ = self.store._run_upload(job)
+        self.assertTrue(ok)
+        self.assertIn("--saver", run.call_args.args[0])
+        self.assertNotIn("--use-quota", run.call_args.args[0])
+        with self.assertRaises(UserError):
+            self.store.set_upload_quality(source_id, "invalid")
+        self.store.set_upload_quality(source_id, "original")
+        with mock.patch("webui.server.subprocess.run",
+                        return_value=mock.Mock(returncode=0,
+                                               stdout='{"mediaKey":"TEST"}')) as run:
+            ok, _, _ = self.store._run_upload(job)
+        self.assertTrue(ok)
+        self.assertNotIn("--saver", run.call_args.args[0])
+        self.assertNotIn("--use-quota", run.call_args.args[0])
+        self.store.upload_enabled = True
+        with self.assertRaises(UserError):
+            self.store.set_upload_quality(source_id, "storage_saver")
+        self.store.upload_enabled = False
+        with self.store.connection() as con:
+            con.execute("UPDATE jobs SET status='api_accepted' WHERE id=?", (job["id"],))
+        self.store.set_cloud_verified(job["id"], True)
+        self.store.set_display(source_id, "removed")
+        self.store.add_source(str(self.source), "directory")
+        self.assertEqual(self.store.sources()[0]["upload_quality"], "original")
+        accepted = next(j for j in self.store.jobs() if j["id"] == job["id"])
+        self.assertEqual(accepted["status"], "api_accepted")
+        self.assertTrue(accepted["cloud_verified_at"])
 
     def test_cli_album_flag_and_single_image_mode(self):
         self.store.add_source(str(self.source), "directory")
@@ -373,6 +413,19 @@ class WebUITest(unittest.TestCase):
                         {"X-GU-CSRF": token})
         self.assertEqual(status, 200)
         self.wait_for_jobs(1)
+        source_id = self.store.sources()[0]["id"]
+        status, _ = req("POST", "/api/source/quality",
+                        {"id": source_id, "quality": "original"})
+        self.assertEqual(status, 403)
+        status, result = req("POST", "/api/source/quality",
+                             {"id": source_id, "quality": "original"},
+                             {"X-GU-CSRF": token})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.store.sources()[0]["upload_quality"], "original")
+        status, _ = req("POST", "/api/source/quality",
+                        {"id": source_id, "quality": "unsupported"},
+                        {"X-GU-CSRF": token})
+        self.assertEqual(status, 400)
         status, tasks = req("GET", "/api/jobs")
         self.assertEqual(status, 200)
         self.assertTrue(isinstance(tasks["jobs"], list))

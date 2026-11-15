@@ -135,7 +135,8 @@ class Store:
                 ui_visibility TEXT NOT NULL DEFAULT 'visible',
                 album_name TEXT NOT NULL DEFAULT '',
                 album_confirmed INTEGER NOT NULL DEFAULT 0,
-                album_confirmed_at TEXT NOT NULL DEFAULT ''
+                album_confirmed_at TEXT NOT NULL DEFAULT '',
+                upload_quality TEXT NOT NULL DEFAULT 'storage_saver'
               );
               CREATE TABLE IF NOT EXISTS jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -202,6 +203,7 @@ class Store:
                 "album_name": "TEXT NOT NULL DEFAULT ''",
                 "album_confirmed": "INTEGER NOT NULL DEFAULT 0",
                 "album_confirmed_at": "TEXT NOT NULL DEFAULT ''",
+                "upload_quality": "TEXT NOT NULL DEFAULT 'storage_saver'",
             }
             job_cols = {
                 "mtime_ns": "INTEGER NOT NULL DEFAULT 0",
@@ -445,6 +447,26 @@ class Store:
                         (title, now(), int(source_id)))
             self._event(con, int(source_id), "album_confirmed",
                         "用户确认相册名：" + title)
+        return self.sources()
+
+    def set_upload_quality(self, source_id, quality):
+        """Change the upload quality for future media only."""
+        if quality not in ("storage_saver", "original"):
+            raise UserError("仅支持 Storage saver 或 Original quality")
+        if self.upload_enabled:
+            raise UserError("请先停止自动同步，再调整画质")
+        with self.connection() as con:
+            source = con.execute("SELECT upload_quality FROM sources WHERE id=?",
+                                 (int(source_id),)).fetchone()
+            if not source:
+                raise UserError("来源不存在")
+            if con.execute("""SELECT 1 FROM jobs WHERE source_id=? AND status='uploading'
+                              LIMIT 1""", (int(source_id),)).fetchone():
+                raise UserError("当前文件正在上传，请上传结束后再修改画质")
+            if source["upload_quality"] != quality:
+                con.execute("UPDATE sources SET upload_quality=? WHERE id=?",
+                            (quality, int(source_id)))
+                self._event(con, int(source_id), "upload_quality", "后续上传画质：" + quality)
         return self.sources()
 
     def set_display(self, source_id, mode):
@@ -934,15 +956,19 @@ class Store:
         if self._digest(path) != job["digest"]:
             return False, "", "源文件内容变化，请重新扫描"
         with self.connection() as con:
-            source = con.execute("""SELECT album_name,album_confirmed,enabled,archived
+            source = con.execute("""SELECT album_name,album_confirmed,enabled,archived,upload_quality
                                     FROM sources WHERE id=?""", (job["source_id"],)).fetchone()
         if not source or not source["album_confirmed"] or not source["album_name"]:
             return False, "", "来源相册尚未确认，禁止上传"
         if not source["enabled"] or source["archived"]:
             return False, "", "来源未启用，禁止上传"
+        if source["upload_quality"] not in ("storage_saver", "original"):
+            return False, "", "未知上传画质，拒绝上传"
         timeout = min(21600, max(600, job["bytes"] // 51200))
-        cmd = [str(self.cli), "--config", str(self.credentials),
-               "upload", "--no-tui", "--saver", "--album", source["album_name"], str(path)]
+        cmd = [str(self.cli), "--config", str(self.credentials), "upload", "--no-tui"]
+        if source["upload_quality"] == "storage_saver":
+            cmd.append("--saver")
+        cmd.extend(["--album", source["album_name"], str(path)])
         try:
             result = subprocess.run(cmd, capture_output=True, text=True,
                                     timeout=timeout, check=False)
@@ -1179,6 +1205,9 @@ def make_handler(store):
                 elif uri == "/api/source/album":
                     result = {"sources": store.set_album(
                         int(payload["id"]), payload.get("album_name"))}
+                elif uri == "/api/source/quality":
+                    result = {"sources": store.set_upload_quality(
+                        int(payload["id"]), payload.get("quality"))}
                 elif uri == "/api/source/test-upload":
                     result = {"test": store.test_one_image(int(payload["id"]))}
                 elif uri == "/api/source/restore":
