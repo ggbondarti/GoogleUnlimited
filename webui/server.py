@@ -134,6 +134,7 @@ class Store:
                 last_checked_at TEXT NOT NULL DEFAULT '',
                 ui_visibility TEXT NOT NULL DEFAULT 'visible',
                 album_name TEXT NOT NULL DEFAULT '',
+                album_key TEXT NOT NULL DEFAULT '',
                 album_confirmed INTEGER NOT NULL DEFAULT 0,
                 album_confirmed_at TEXT NOT NULL DEFAULT '',
                 upload_quality TEXT NOT NULL DEFAULT 'storage_saver'
@@ -201,6 +202,7 @@ class Store:
                 "last_checked_at": "TEXT NOT NULL DEFAULT ''",
                 "ui_visibility": "TEXT NOT NULL DEFAULT 'visible'",
                 "album_name": "TEXT NOT NULL DEFAULT ''",
+                "album_key": "TEXT NOT NULL DEFAULT ''",
                 "album_confirmed": "INTEGER NOT NULL DEFAULT 0",
                 "album_confirmed_at": "TEXT NOT NULL DEFAULT ''",
                 "upload_quality": "TEXT NOT NULL DEFAULT 'storage_saver'",
@@ -435,18 +437,56 @@ class Store:
         if self.upload_enabled:
             raise UserError("请先关闭真实上传开关，然后再调整相册名称")
         with self.connection() as con:
-            source = con.execute("SELECT id,album_name FROM sources WHERE id=?",
+            source = con.execute("SELECT id,album_name,album_key FROM sources WHERE id=?",
                                  (int(source_id),)).fetchone()
             if not source:
                 raise UserError("来源不存在")
             if con.execute("""SELECT 1 FROM jobs WHERE source_id=? AND status='uploading'
                               LIMIT 1""", (int(source_id),)).fetchone():
                 raise UserError("来源有进行中的上传，请在结束后修改相册")
+            if source["album_key"] and source["album_name"] != title:
+                raise UserError("已绑定云端相册 ID，不能仅改本地名称而创建重复相册")
             con.execute("""UPDATE sources SET album_name=?,album_confirmed=1,
                            album_confirmed_at=? WHERE id=?""",
                         (title, now(), int(source_id)))
             self._event(con, int(source_id), "album_confirmed",
                         "用户确认相册名：" + title)
+        return self.sources()
+
+    @staticmethod
+    def _album_key(value):
+        """Accept a Google Photos existing album URL or key, never an album title."""
+        if not isinstance(value, str):
+            raise UserError("请输入已有相册的 Google Photos 链接或 ID")
+        value = value.strip()
+        if value.startswith("https://photos.google.com/album/"):
+            parsed = urlsplit(value)
+            value = parsed.path.removeprefix("/album/")
+        if not re.fullmatch(r"AF1Qip[A-Za-z0-9_-]{8,500}", value):
+            raise UserError("相册 ID 无效，请在 Google Photos 打开目标相册复制链接")
+        return value
+
+    def bind_album(self, source_id, album_ref):
+        """Explicitly reuse an existing album. Never moves or deletes cloud media."""
+        key = self._album_key(album_ref)
+        if self.upload_enabled:
+            raise UserError("请先停止自动同步，再绑定相册")
+        with self.connection() as con:
+            source = con.execute(
+                "SELECT id,album_name,album_key FROM sources WHERE id=?",
+                (int(source_id),)).fetchone()
+            if not source or not source["album_name"]:
+                raise UserError("请先设置相册名称")
+            if con.execute("""SELECT 1 FROM jobs WHERE source_id=? AND status='uploading'
+                              LIMIT 1""", (int(source_id),)).fetchone():
+                raise UserError("等待当前文件上传完成后再绑定相册")
+            if source["album_key"] and source["album_key"] != key:
+                raise UserError("已绑定另一个相册，不能直接覆盖，避免文件分散")
+            con.execute("""UPDATE sources SET album_key=?,album_confirmed=1,
+                           album_confirmed_at=? WHERE id=?""",
+                        (key, now(), int(source_id)))
+            self._event(con, int(source_id), "album_bound", "已绑定现有 Google Photos 相册")
+        self.wake_event.set()
         return self.sources()
 
     def set_upload_quality(self, source_id, quality):
@@ -944,6 +984,9 @@ class Store:
                  JOIN sources s ON s.id=j.source_id AND s.enabled=1
                  AND s.archived=0 AND s.availability='online'
                  AND s.album_confirmed=1 AND s.album_name!=''
+                 AND (s.album_key!='' OR NOT EXISTS (
+                      SELECT 1 FROM jobs old WHERE old.source_id=s.id
+                      AND old.status='api_accepted'))
                  WHERE (j.status='queued' OR (j.status='retrying' AND j.retry_at<=?))
                    AND j.file_available=1 """ + condition +
                  " ORDER BY " + ordering + " LIMIT 1", args).fetchone()
@@ -952,38 +995,50 @@ class Store:
         """Only called when explicit credentials, env gate and UI enable all hold."""
         path = Path(job["path"])
         if not self._eligible(path):
-            return False, "", "源文件消失或无效"
+            return False, "", "源文件消失或无效", ""
         if self._digest(path) != job["digest"]:
-            return False, "", "源文件内容变化，请重新扫描"
+            return False, "", "源文件内容变化，请重新扫描", ""
         with self.connection() as con:
-            source = con.execute("""SELECT album_name,album_confirmed,enabled,archived,upload_quality
+            source = con.execute("""SELECT album_name,album_key,album_confirmed,enabled,archived,upload_quality
                                     FROM sources WHERE id=?""", (job["source_id"],)).fetchone()
         if not source or not source["album_confirmed"] or not source["album_name"]:
-            return False, "", "来源相册尚未确认，禁止上传"
+            return False, "", "来源相册尚未确认，禁止上传", ""
         if not source["enabled"] or source["archived"]:
-            return False, "", "来源未启用，禁止上传"
+            return False, "", "来源未启用，禁止上传", ""
         if source["upload_quality"] not in ("storage_saver", "original"):
-            return False, "", "未知上传画质，拒绝上传"
+            return False, "", "未知上传画质，拒绝上传", ""
+        if not source["album_key"]:
+            with self.connection() as con:
+                prior = con.execute("""SELECT 1 FROM jobs WHERE source_id=?
+                        AND status='api_accepted' LIMIT 1""", (job["source_id"],)).fetchone()
+            if prior:
+                return False, "", "旧相册 ID 未绑定，请先确认目标相册后再继续", ""
         timeout = min(21600, max(600, job["bytes"] // 51200))
         cmd = [str(self.cli), "--config", str(self.credentials), "upload", "--no-tui"]
         if source["upload_quality"] == "storage_saver":
             cmd.append("--saver")
-        cmd.extend(["--album", source["album_name"], str(path)])
+        cmd.extend(["--album", source["album_key"] or source["album_name"], str(path)])
         try:
             result = subprocess.run(cmd, capture_output=True, text=True,
                                     timeout=timeout, check=False)
         except (OSError, subprocess.TimeoutExpired) as exc:
-            return False, "", "上传进程异常：" + type(exc).__name__
+            return False, "", "上传进程异常：" + type(exc).__name__, ""
         if result.returncode != 0:
-            return False, "", f"上传进程退出码 {result.returncode}（详情请在本机 CLI 排查）"
+            return False, "", f"上传进程退出码 {result.returncode}（详情请在本机 CLI 排查）", ""
         # Do not expose raw stdout (could hold private provider metadata).
         output = result.stdout
         if re.search(r'"(?:error|message)"\s*:\s*"(?!")', output):
-            return False, "", "API 返回错误"
+            return False, "", "API 返回错误", ""
         key = re.search(r'"mediaKey"\s*:\s*"([^"]{1,500})"', output)
         if not key:
-            return False, "", "缺少可核对的 mediaKey，未登记为成功"
-        return True, key.group(1), ""
+            return False, "", "缺少可核对的 mediaKey，未登记为成功", ""
+        album = re.search(r'"albumKeys"\s*:\s*\[\s*"([^"]{1,550})"', output)
+        album_key = album.group(1) if album else ""
+        if album_key and not re.fullmatch(r"AF1Qip[A-Za-z0-9_-]{8,500}", album_key):
+            album_key = ""
+        # If the CLI succeeded but omitted albumKeys, retain the accepted
+        # mediaKey. The next job is blocked until an album ID is bound.
+        return True, key.group(1), "", album_key
 
     def run_one(self, *, source_id=None, image_only=False, manual=False):
         if not ((manual or self.upload_enabled) and self._auth_ready()):
@@ -1021,9 +1076,15 @@ class Store:
         if is_duplicate:
             self._rebuild_folder_index(job["source_id"])
             return True
-        ok, media_key, error = self._run_upload(job)
+        outcome = self._run_upload(job)
+        ok, media_key, error = outcome[:3]
+        album_key = outcome[3] if len(outcome) > 3 else ""
         with self.connection() as con:
             if ok:
+                if album_key:
+                    con.execute("""UPDATE sources SET album_key=?
+                                   WHERE id=? AND album_key=''""",
+                                (album_key, job["source_id"]))
                 con.execute("""UPDATE jobs SET status='api_accepted',media_key=?,error='',updated_at=?
                                WHERE id=?""", (media_key, now(), job["id"]))
                 con.execute("""UPDATE jobs SET status='duplicate',duplicate_of=?,updated_at=?
@@ -1205,6 +1266,9 @@ def make_handler(store):
                 elif uri == "/api/source/album":
                     result = {"sources": store.set_album(
                         int(payload["id"]), payload.get("album_name"))}
+                elif uri == "/api/source/album/bind":
+                    result = {"sources": store.bind_album(
+                        int(payload["id"]), payload.get("album_ref"))}
                 elif uri == "/api/source/quality":
                     result = {"sources": store.set_upload_quality(
                         int(payload["id"]), payload.get("quality"))}

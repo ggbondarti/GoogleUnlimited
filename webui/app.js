@@ -114,6 +114,10 @@ function renderSources(sources) {
     else if (source.availability === "interrupted") badges.push("扫描中断");
     else if (source.availability === "unknown") badges.push("等待重新扫描");
     else if (!source.enabled) badges.push("已暂停");
+    if (source.api_accepted > 0 && !source.album_key)
+      badges.push("相册 ID 未绑定 · 暂停后续上传");
+    else if (source.album_key)
+      badges.push("已绑定云端相册");
     const sourcePath = element("small", null, source.path);
     sourcePath.title = source.path; // truncated long paths remain inspectable.
     info.appendChild(sourcePath);
@@ -243,6 +247,37 @@ function renderSources(sources) {
       } catch (error) { notice(error.message); }
     });
     albumBody.appendChild(confirmAlbum);
+    const bindingStatus = element("small", "source-album-hint",
+      source.album_key ? "已绑定云端相册 ID；后续照片会加入同一个相册。" :
+      (source.api_accepted > 0 ?
+        "重要：历史文件已上传但缺少相册 ID。为防止重复创建，已阻止此来源继续上传，请绑定一个已存在的相册。" :
+        "首次成功上传会创建相册并自动保存 ID，后续复用同一个相册。"));
+    albumBody.appendChild(bindingStatus);
+    if (source.album_key) {
+      const link = element("a", "source-album-link", "在 Google Photos 查看已绑定相册");
+      link.href = "https://photos.google.com/album/" + source.album_key;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      albumBody.appendChild(link);
+    } else {
+      const bindInput = element("input", "album-name-input");
+      bindInput.type = "url";
+      bindInput.placeholder = "粘贴已有 Google Photos 相册链接";
+      bindInput.autocomplete = "off";
+      albumBody.appendChild(bindInput);
+      const bindButton = element("button", "btn soft", "绑定现有相册（防止重复创建）");
+      bindButton.type = "button";
+      bindButton.disabled = !!currentStatus?.upload_enabled;
+      bindButton.addEventListener("click", async () => {
+        if (!confirm("确认此相册属于当前来源目录？后续文件会加入此相册，不会自动整理已创建的其他相册。")) return;
+        try {
+          await post("/api/source/album/bind", {id: source.id, album_ref: bindInput.value});
+          notice("已保存云端相册 ID。不会删除或重传旧文件。", true);
+          await refresh();
+        } catch (error) { notice(error.message); }
+      });
+      albumBody.appendChild(bindButton);
+    }
     const qualityLabel = element("label", "source-quality-label", "后续上传画质");
     const qualitySelect = element("select", "source-quality-select");
     for (const choice of [

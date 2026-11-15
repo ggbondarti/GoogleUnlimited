@@ -172,7 +172,7 @@ class WebUITest(unittest.TestCase):
         with mock.patch("webui.server.subprocess.run",
                         return_value=mock.Mock(returncode=0,
                                                stdout='{"mediaKey":"TEST"}')) as run:
-            ok, _, _ = self.store._run_upload(job)
+            ok, _, _, _ = self.store._run_upload(job)
         self.assertTrue(ok)
         self.assertIn("--saver", run.call_args.args[0])
         self.assertNotIn("--use-quota", run.call_args.args[0])
@@ -182,7 +182,7 @@ class WebUITest(unittest.TestCase):
         with mock.patch("webui.server.subprocess.run",
                         return_value=mock.Mock(returncode=0,
                                                stdout='{"mediaKey":"TEST"}')) as run:
-            ok, _, _ = self.store._run_upload(job)
+            ok, _, _, _ = self.store._run_upload(job)
         self.assertTrue(ok)
         self.assertNotIn("--saver", run.call_args.args[0])
         self.assertNotIn("--use-quota", run.call_args.args[0])
@@ -209,7 +209,7 @@ class WebUITest(unittest.TestCase):
         with mock.patch("webui.server.subprocess.run",
                         return_value=mock.Mock(returncode=0,
                                                stdout='{"mediaKey":"MOCK_MEDIA_KEY"}')) as cmd:
-            ok, key, error = self.store._run_upload(job)
+            ok, key, error, album_key = self.store._run_upload(job)
         self.assertTrue(ok)
         self.assertEqual(key, "MOCK_MEDIA_KEY")
         args = cmd.call_args.args[0]
@@ -232,6 +232,81 @@ class WebUITest(unittest.TestCase):
         self.assertEqual(result["album"], "旅程测试相册")
         self.store._run_upload.assert_called_once()
         self.assertFalse(self.store.upload_enabled)  # Never opens the batch gate.
+
+    def test_single_cloud_album_reused_across_uploads_and_restart(self):
+        """First upload creates a named album; next must use its returned ID."""
+        self.media2.write_bytes(b"B" * 15000)
+        self.store.add_source(str(self.source), "directory")
+        self.wait_for_jobs(2)
+        album_key = "AF1Qip" + "K" * 36
+        self.store.allow_upload = True
+        self.store.cli = self.base / "fake_cli"
+        self.store.cli.write_bytes(b"FAKE")
+        self.store.credentials.write_text("NOT_A_REAL_TOKEN")
+        self.store.credentials.chmod(0o600)
+        responses = [
+            mock.Mock(returncode=0, stdout=json.dumps({
+                "results": [{"mediaKey": "MOCK_FIRST"}],
+                "album": {"albumKeys": [album_key]}
+            })),
+            mock.Mock(returncode=0, stdout=json.dumps({
+                "results": [{"mediaKey": "MOCK_SECOND"}],
+                "album": {"albumKeys": [album_key]}
+            })),
+        ]
+        with mock.patch.object(self.store, "_ensure_upload_ready"), mock.patch(
+                "webui.server.subprocess.run", side_effect=responses) as runner:
+            self.assertTrue(self.store.run_one(manual=True))
+            self.assertEqual(self.store.sources()[0]["album_key"], album_key)
+            self.assertTrue(self.store.run_one(manual=True))
+        first, second = (c.args[0] for c in runner.call_args_list)
+        self.assertEqual(first[first.index("--album") + 1], "source")
+        self.assertEqual(second[second.index("--album") + 1], album_key)
+        self.assertEqual({j["status"] for j in self.store.jobs()}, {"api_accepted"})
+        reopened = Store(self.base / "state", worker=False)
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.sources()[0]["album_key"], album_key)
+
+    def test_old_accepted_source_requires_existing_album_binding(self):
+        self.media2.write_bytes(b"B" * 15000)
+        self.store.add_source(str(self.source), "directory")
+        self.wait_for_jobs(2)
+        source_id = self.store.sources()[0]["id"]
+        first = self.store.jobs()[0]
+        with self.store.connection() as con:
+            con.execute("UPDATE jobs SET status='api_accepted',media_key='ALREADY_IN_CLOUD' WHERE id=?",
+                        (first["id"],))
+        self.assertIsNone(self.store._next_job())
+        with self.assertRaises(UserError):
+            self.store.bind_album(source_id, "https://other.example.com/album/bad")
+        key = "AF1Qip" + "Z" * 36
+        self.store.bind_album(source_id, "https://photos.google.com/album/" + key)
+        self.assertEqual(self.store.sources()[0]["album_key"], key)
+        self.assertIsNotNone(self.store._next_job())
+        with self.assertRaises(UserError):
+            self.store.set_album(source_id, "different album")
+        with self.assertRaises(UserError):
+            self.store.bind_album(source_id, "AF1Qip" + "Y" * 36)
+        self.assertEqual(self.store.sources()[0]["album_key"], key)
+        self.assertEqual(len(self.store.jobs()), 2)
+
+    def test_success_without_album_key_halts_before_next_upload(self):
+        self.media2.write_bytes(b"B" * 15000)
+        self.store.add_source(str(self.source), "directory")
+        self.wait_for_jobs(2)
+        self.store.allow_upload = True
+        self.store.cli = self.base / "fake_cli"
+        self.store.cli.write_bytes(b"FAKE")
+        self.store.credentials.write_text("NOT_A_REAL_TOKEN")
+        self.store.credentials.chmod(0o600)
+        with mock.patch.object(self.store, "_ensure_upload_ready"), mock.patch(
+                "webui.server.subprocess.run",
+                return_value=mock.Mock(returncode=0,
+                                       stdout='{"mediaKey":"MOCK_ACCEPTED"}')):
+            self.assertTrue(self.store.run_one(manual=True))
+        self.assertEqual(self.store.sources()[0]["album_key"], "")
+        self.assertIsNone(self.store._next_job())
+        self.assertEqual(sum(j["status"] == "api_accepted" for j in self.store.jobs()), 1)
 
     def test_album_persists_after_hide_remove_and_readd(self):
         self.store.add_source(str(self.source), "directory")

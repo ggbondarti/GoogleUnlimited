@@ -343,6 +343,27 @@ bash google-unlimited.sh help
 
 固定源码功能提交 7534f1ac3832882b52dec1892853a5ac49007526，另修复一项 Linux 上传进度测试：Linux 页面缓存命中会令 /proc/io read_bytes 统计不足，因此测试改为可持续观测的 rchar 读取量及长寿命测试进程。提交 ff46ab6599e9047267467ced8d9f6d138deb85c8 对应的 GitHub Actions 43690753862 已验证 Linux、macOS、Windows 及 Lint 四组成功；34 项本地 Python 测试通过。
 
+### 9.16 同名相册爆炸修复与 Original 单张回归（2026-11-15）
+
+**根因（已从固定 gotohp 源码核实）**：WebUI 原先对每一张图片/视频独立执行 `upload --album "<来源相册名>" <文件>`；gotohp 的 `AddToAlbum` 在参数不是以 `AF1Qip` 开头的云端 ID 时会直接创建新相册，导致同一个来源每项媒体都产生一个同名、仅 1 item 的相册。不是 Google Photos 的正常行为，也与画质模式无关。
+
+**已修改代码**：
+
+- `sources.album_key` 增量迁移并持久化保存：首次上传由 gotohp 返回 `album.albumKeys[0]` 后写库；以后传 `--album <album_key>`，使用已有相册而非反复新建。CLI 原本的媒体 `mediaKey` 和 `api_accepted` 保留。
+- 对已存在 `api_accepted` 但缺少云端相册 ID 的历史来源，`_next_job` 及上传执行层双重保护，**暂停后续任务**；不因绑定失败删除/重传/重置历史。
+- `POST /api/source/album/bind` 与 WebUI「绑定现有相册」：本机用户粘贴完整 Google Photos 相册链接或 ID，验证格式并记录；禁止在自动同步过程中重新绑定、禁止已有 ID 静默换绑；来源主卡片显示是否已绑定。
+- 保留 Storage saver 与 Original quality 的来源级设置和已上传记录；更改画质不重新排队已完成项。以后相册重命名必须采用独立的云端操作，不允许只改本地名称造成新相册。
+
+**真实部署和验证**：先通过本机 API 停止自动同步，等待原本最后一条在途任务完成，保留用户已有 51 项 `api_accepted` 和 166 项 queued；SQLite 采用官方 backup API 写入 Git 忽略的 `queue.pre-album-id-fix-20261115.sqlite3`。只在验证 8796 端口和原进程 PID 相匹配后重启 WebUI，新服务健康检查 HTTP 200，`auto_sync_enabled=false`，自编译引擎 SHA 校验通过。对用户此前提供的同名相册链接，在暂停状态下通过新 API 绑定现有相册；未在公共文件中写入相册 ID。
+
+**原画质新测试**：在已绑定现有云端相册的来源，把画质暂时改为 `original` 并仅发起 1 张尚未上传图片（任务 ID 207），得到 `api_accepted`，未添加 `--saver`。随后立即恢复 `storage_saver`，保持批量同步 OFF 等待旧相册归集检查。该结果证明 Original 模式请求可成功提交，不是 Google 官方详情页对最终原画质、实际配额或 Pixel 身份的证明。
+
+**无凭据回归**：Python WebUI 31 项测试通过，项目全部 Python 单测 37 项通过，其中新增首次取回并持久化相册 ID、下一项使用相同 ID、历史有成功记录但无 ID 时拒绝继续领取、缺失 albumKeys 时停止后续上传等保护；Python `py_compile`、Node `--check`、`git diff --check` 通过。
+
+**历史归集实测与恢复**：为了不重传原文件，新增独立模块 `engine/album-attach/`（不修改经过哈希固定的 `engine/gotohp-src/`），通过本机编译后的 helper 对已有的 51 个 `mediaKey` 执行向同一个**现有** Google Photos 相册添加成员：先单项验证成功，后续 50 项一次提交成功；工具不创建或删除云端相册，也不重新上传二进制媒体。私有批次 JSON 用完删除，结果仅记录于本地 Git 忽略的 state 数据库/JSON 中。新建的 Original 单张试传任务 207 成功；恢复 Storage saver 后再测试任务 209 成功。引擎一度因临时辅助源码放错位置触发源码哈希门禁拒绝上传，已移到独立目录并重新验证“源码、二进制、构建清单一致”，没有绕过门禁。最终恢复 `/api/sync` 为 ON，WebUI 显示监控 ON、上传 ON、画质 Storage saver、绑定相册 ID；正在运行的 gotohp 进程命令已验证 `--album` 携带相册 ID 而不是同名标题。
+
+**官方云端验收边界**：51 项历史归集是 Google API 成功返回，不代替在 Google Photos 浏览器页面独立核对相册数量与成员；旧的单文件相册全部保留，不自动删除。Original 单张 API 成功也不等于 Google 官方质量标签或免配额结论。
+
 ## 10. 之前阶段待办与交接
 
 
