@@ -296,6 +296,18 @@ bash google-unlimited.sh help
 - **实际授权测试**：Mac M2 自编译 owned 引擎哈希通过，但 `webui/state/gotohp.config` **不存在**。尝试在已连接的 OpenCLI Profile `8pndk8ba` 中加载 Google `EmbeddedSetup` 登录授权页，浏览器 Bridge 的新建标签/页面状态及当前 URL 读取均发生超时，无法取得有效本机 gotohp 授权；**没有提取或输出任何 Cookie、oauth_token 或 Google Master Token**。已登录 Chrome 不等于 gotohp CLI 获得独立访问凭据，因此单张真实上传**没有发生**。不要通过无人值守命令绕过 Google 的重新登录、安全验证或用户同意。
 - **只剩一个真正前置条件**：目标测试账号需在本机完成 Google Embedded Setup 授权，并仅将一次性 `oauth_token` 经**本机 Terminal** 的 `bash scripts/authorize_local.sh` 输入（不要发送给 AI/远程服务器）。确认 `gotohp.config` 建立、账号匹配之后，才以 `--engine owned --allow-real-upload` 启动项目服务（批量仍 OFF）并点击来源 2 的单张试传。最后回到**同一独立账号**的 Google Photos，核对是否显示照片和共享空间是否变化；统计可能延迟。需要有凭据才能继续，不能谎报已完成上传。
 
+### 9.12 独立账号首张 Mac 直传与官方云端核验（2026-11-15 北京时间）
+
+**真实验收结果：成功上传一张图片，已看到目标相册与一项媒体；共享配额前后显示一致，但免费容量资格尚需复核统计延迟。**
+
+- **账号与凭据**：用户本人通过 Mac M2 的 `scripts/authorize_local.sh` 完成 Google Embedded Setup 临时凭据交换，本机 `webui/state/gotohp.config` 文件存在，权限 `0600`。CLI `creds list` 返回 1 个已选中账号，并与用户之前截图的 Chrome Profile `8pndk8ba` 账号一致（仅在本机作相等性比对；这里不记录邮箱或任何 Token）。先前“Chrome 登录不能代表 gotohp 授权”的阻断已解除。用户曾在 ChatGPT 聊天中粘贴一次性 `oauth_token`，**不在日志/代码中复制该值**；后续应避免再发送凭据，视需要在 Google 账号安全设置中结束有关登录会话。
+- **源与备份**：测试来源 ID 2，NAS 路径 `/Volumes/WIN10/photo/2020@11月行程 南宁武汉贵州长白山 已nas`，相册 `2020@11月行程 南宁武汉贵州长白山` 已由用户指定并在 WebUI 明确确认为 `album_confirmed=1`。测试前使用 SQLite 原生 `backup()` 备份数据库到本机 Git 忽略的 `webui/state/queue.pre-first-owned-live-test-20261114.sqlite3`（409600 bytes），基线来源 1：369 queued、来源 2：217 queued。
+- **真正执行过程**：安全重启本项目 WebUI（先确认 8796 端口与 PID 所属，命令 `python3 webui/server.py --port 8796 --engine owned --allow-real-upload`），保持全局 `upload_enabled=false`、`monitor_enabled=false`。通过带 CSRF 的 `POST /api/source/test-upload`，仅为 ID 2 选取本来源最小的一张未上传 JPEG（job ID 2，约 **3,763,142 bytes**），自编译 gotohp v0.11.0 CLI 以 `upload --no-tui --saver --album <指定相册名>` 发起真实上传，耗时 **13.7 秒**，HTTP 200，JSON 返回 `status=api_accepted`，有 44 字符长度的 provider mediaKey（**不记录其实际值**）。
+- **官方 Google Photos 页面核对**：OpenCLI Browser Bridge 重启后重新连接 Profile `8pndk8ba`。官方 `https://photos.google.com/albums` 的相册列表出现本次目标相册，并显示 **1 item**；随后打开该相册的 `https://photos.google.com/album/…` 页面，标题与目标旅行相册名称一致，页面 DOM 存在照片图像内容。因此将 job ID 2 的 `cloud_verified_at` 标为已核验，方法 `manual`，不是仅凭 CLI 返回就认定云端成功。
+- **存储配额实测**：试传前，Chrome 官方 `https://photos.google.com/quotamanagement` 显示 Google 全账号共享存储 **88.8 MB of 15 GB used**，Google Photos 本身据用户确认原先没有照片；试传并显示该相册 1 item 后，同一 Chrome Profile 官方页面仍显示 **88.8 MB of 15 GB used**，剩余 14.9 GB。这个数值是 Gmail/Drive/Photos **全账号共享**用量，不是照片本身用量；上传的是约 3.76 MB JPEG，故前后“显示没有增长”是有价值的**初步结果**。但 Google 可能缓存、延迟更新或随后重新核算，因此**不能据一次快照断言 Mac 将永久获得 Pixel 免费无限配额**，应稍后再核对。
+- **最终安全收尾**：再次安全重启项目 8796 服务到 `--engine owned`（**没有 `--allow-real-upload` 参数**），`allow_real_upload=false`、`upload_enabled=false`、`monitor_enabled=false`，授权文件保留在 Mac 本机未提交。数据库核验：来源 1 **369 queued**，来源 2 **1 api_accepted + 216 queued**，试传 job ID 2 `cloud_verify_method=manual` 且时间戳非空；其它媒体任务未开始上传、内容未删除或重置。MI3MountMac 和小米 3 本机 Google Photos 链路未被触碰。
+- **下一步**：用 `8pndk8ba` 在数小时或下一日重新打开官方存储管理页面比较 88.8 MB；如仍维持不变，才是进一步支持“该单张 Mac Storage Saver 上传不计额度”的证据，但仍非永久保证。若开始增长，应停止整批测试并检查 gotohp Upload Saver/Google 端政策。不应在未核验延迟用量前自动启动 216 张的批量上传。
+
 ## 10. 之前阶段待办与交接
 
 
