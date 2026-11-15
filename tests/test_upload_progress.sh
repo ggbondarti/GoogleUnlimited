@@ -134,12 +134,15 @@ get_process_io_read() {
     for p in "${pids[@]}"; do
         if [ -r "/proc/$p/io" ]; then
             local r
-            r=$(awk '/^read_bytes:/ {print $2}' "/proc/$p/io" 2>/dev/null || true)
+            # read_bytes only accounts for physical disk I/O, which can be 0
+            # for Linux page-cache hits. rchar measures reads from the process
+            # regardless of cache and is stable for this synthetic test.
+            r=$(awk '/^rchar:/ {print $2}' "/proc/$p/io" 2>/dev/null || true)
             if [ -n "$r" ] && [ "$r" -gt 0 ]; then
                 total=$((total + r))
             else
                 local rc
-                rc=$(awk '/^rchar:/ {print $2}' "/proc/$p/io" 2>/dev/null || true)
+                rc=$(awk '/^read_bytes:/ {print $2}' "/proc/$p/io" 2>/dev/null || true)
                 if [ -n "$rc" ] && [ "$rc" -gt 0 ]; then
                     total=$((total + rc))
                 fi
@@ -153,17 +156,22 @@ get_process_io_read() {
 tmp_test_file="$(mktemp "${TMPDIR:-/tmp}/test_io_XXXXXX.dat")"
 dd if=/dev/urandom of="$tmp_test_file" bs=1M count=4 2>/dev/null
 
-# Launch child process that reads the file
-(
-    sleep 0.2
-    cat "$tmp_test_file" > /dev/null
-    sleep 0.3
-) &
+# Launch a reader that remains alive across both samples, so the Linux
+# /proc counter is not lost when a short-lived cat child exits.
+python3 - "$tmp_test_file" <<'PY' &
+import sys
+import time
+time.sleep(0.2)
+with open(sys.argv[1], "rb") as stream:
+    while stream.read(65536):
+        time.sleep(0.008)
+time.sleep(0.5)
+PY
 child_pid=$!
 
 sleep 0.1
 init_read="$(get_process_io_read "$child_pid")"
-sleep 0.3
+sleep 0.8
 mid_read="$(get_process_io_read "$child_pid")"
 wait "$child_pid" || true
 rm -f "$tmp_test_file"
