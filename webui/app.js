@@ -114,6 +114,10 @@ function renderSources(sources) {
     else if (source.availability === "interrupted") badges.push("扫描中断");
     else if (source.availability === "unknown") badges.push("等待重新扫描");
     else if (!source.enabled) badges.push("已暂停");
+    if (source.enabled && !source.archived)
+      badges.push(source.upload_ready
+        ? (currentStatus?.upload_enabled ? "已允许上传" : "上传许可已保存 · 全局暂停")
+        : "待确认上传 · 仅扫描");
     if (source.api_accepted > 0 && !source.album_key)
       badges.push("相册 ID 未绑定 · 暂停后续上传");
     else if (source.album_key)
@@ -133,7 +137,7 @@ function renderSources(sources) {
         "Storage saver（节省空间）")));
     info.appendChild(element("small", "source-album-caption",
       "Google Photos 相册：" + (source.album_name || "尚未设定") +
-      (source.album_confirmed ? "" : " · 添加此来源后自动使用该名称")));
+      (source.album_confirmed ? "" : " · 待手动确认")));
     row.appendChild(info);
     // Keep every action inside ONE grid cell. Previously they were siblings of
     // the text column and a full-width <details>; flexbox compressed the path
@@ -180,6 +184,26 @@ function renderSources(sources) {
       const toggle = element("label", "switch");
       toggle.append(checkbox, element("span"));
       controls.appendChild(toggle);
+      const uploadButton = element("button", source.upload_ready ? "btn warn" : "btn primary",
+        source.upload_ready ? "■ 暂停此来源上传" : "允许此来源上传");
+      uploadButton.type = "button";
+      uploadButton.disabled = !source.enabled || (!source.upload_ready && !source.album_confirmed);
+      uploadButton.title = source.upload_ready
+        ? "停止后续文件进入上传；已经启动的单个文件可完成"
+        : (!source.album_confirmed ? "先展开相册设置，保存并确认相册名称" :
+          "确认后才允许此来源的未上传文件加入自动队列");
+      uploadButton.addEventListener("click", async () => {
+        const enabled = !source.upload_ready;
+        if (enabled && !confirm("确认允许此来源上传？\n相册：" + source.album_name +
+          "\n画质：" + (source.upload_quality === "original" ? "Original quality" : "Storage saver") +
+          "\n未上传文件将在全局同步开关启动后自动上传。建议先暂停全局同步进行单张试传。")) return;
+        await action("/api/source/upload", {id: source.id, enabled},
+          enabled
+            ? (currentStatus?.auto_sync_enabled
+              ? "此来源已允许上传，队列将开始处理。" : "此来源已准备好；全局同步仍暂停，你可以先试传或再手动开启。")
+            : "已暂停此来源后续上传，原文件与队列记录不变。");
+      });
+      controls.appendChild(uploadButton);
     }
     if (source.ui_visibility === "visible") {
       const hide = element("button", "btn soft", "隐藏");
@@ -223,7 +247,7 @@ function renderSources(sources) {
     row.appendChild(events);
 
     const album = element("details", "source-album-settings");
-    const summary = element("summary", null, "相册名称（可选修改）与单张试传");
+    const summary = element("summary", null, "上传前设置：相册名称、画质和单张试传");
     album.appendChild(summary);
     const albumBody = element("div", "source-album-form");
     const input = element("input", "album-name-input");
@@ -290,8 +314,9 @@ function renderSources(sources) {
       qualitySelect.appendChild(option);
     }
     qualitySelect.value = source.upload_quality || "storage_saver";
-    qualitySelect.disabled = !!currentStatus?.upload_enabled;
-    qualitySelect.title = "先停止自动同步，再修改该来源后续文件的上传画质";
+    qualitySelect.disabled = !!source.uploading ||
+      (!!source.upload_ready && !!currentStatus?.upload_enabled);
+    qualitySelect.title = "来源正在实际上传时请先点击“暂停此来源上传”";
     qualitySelect.addEventListener("change", async () => {
       const next = qualitySelect.value;
       if (next === "original" && !confirm(
@@ -337,7 +362,7 @@ function renderSources(sources) {
     });
     albumBody.appendChild(test);
     albumBody.appendChild(element("small", "source-album-hint",
-      "默认 Storage saver。先停止自动同步再修改画质；新画质只影响尚未上传的文件，建议先单张测试。"));
+      "新来源默认不会上传。先保存相册、选择画质；全局暂停时可单张测试，完成确认后再允许此来源上传。"));
     album.appendChild(albumBody);
     album.addEventListener("toggle", () => {
       if (album.open) expandedAlbumSources.add(source.id);
@@ -569,15 +594,16 @@ async function refresh() {
       renderPagination(tasks);
     }
     $("sync-switch").checked = !!status.auto_sync_enabled;
+    $("stop-all-btn").disabled = !status.auto_sync_enabled;
     $("credential-state").textContent = status.credentials_present
       ? "存在本机凭据（有效性未验证）" : "尚未配置独立账号";
     $("engine-state").textContent = status.upload_engine === "owned"
       ? (status.owned_build_verified ? "自行编译 · SHA 校验通过" : "自行编译 · 尚未通过构建验证")
       : "第三方发行版 · 固定 SHA-256";
     $("upload-reason").textContent = status.auto_sync_enabled
-      ? "自动扫描并上传已添加的来源；断开硬盘保留记录，重挂载后接着上传。"
+      ? "全局运行中：只上传单独点击“允许此来源上传”的目录。添加新目录仍只扫描。"
       : (status.allow_real_upload && status.credentials_present
-        ? "已停止，记录保留。开启后自动检查并继续；正在传输的文件可正常结束。"
+        ? "已停止，记录保留。可以调整相册名称和画质、进行单张试传；只有已获上传许可的目录会在启动后继续。"
         : "尚未完成本机账号授权或上传引擎未就绪。");
     $("scan-label").textContent = status.scan_running
       ? "正在检查新文件" : (status.auto_sync_enabled ? "自动同步中" : "已停止");
@@ -688,9 +714,7 @@ async function addSource() {
   try {
     await post("/api/sources", {kind: type, path});
     $("source-dialog").close();
-    notice(currentStatus?.auto_sync_enabled
-      ? "已添加 / 恢复来源，自动扫描并续传。已上传的文件不会重复上传。"
-      : "已添加 / 恢复来源，历史保留；启动自动同步即可上传。", true);
+    notice("已添加 / 恢复来源：仅建立 SQLite 索引，不自动上传。请先确认相册名称与画质，测试后点击“允许此来源上传”。", true);
     await refresh();
   } catch (error) {
     $("browser-items").replaceChildren(element("div", "empty", error.message));
@@ -741,10 +765,19 @@ document.addEventListener("DOMContentLoaded", () => {
   for (const select of ["job-source-filter", "job-kind-filter", "job-status-filter"]) {
     $(select).addEventListener("change", () => { pageOffset = 0; refresh(); });
   }
-  $("sync-switch").addEventListener("change", e =>
+  $("sync-switch").addEventListener("change", e => {
+    if (e.target.checked && !confirm(
+      "启动全局自动同步？只有逐个点击过“允许此来源上传”的目录才会继续传输；新添加的目录不会自动上传。")) {
+      e.target.checked = false;
+      return;
+    }
     action("/api/sync", {enabled: e.target.checked},
-      e.target.checked ? "自动同步已启动：新文件直接进入上传队列" :
-        "已停止自动扫描和后续上传，历史仍保留"));
+      e.target.checked ? "全局同步已开启，只处理明确允许上传的来源。" :
+        "已停止全部后续上传和自动扫描，历史与队列完整保留。");
+  });
+  $("stop-all-btn").addEventListener("click", () =>
+    action("/api/sync", {enabled: false},
+      "全部上传已停止，不再领取新任务；如有在途文件，可让当前文件完成。"));
   for (const button of document.querySelectorAll('input[name="kind"]')) {
     button.addEventListener("change", e => {
       modalKind = e.target.value;

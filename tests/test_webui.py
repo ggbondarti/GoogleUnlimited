@@ -120,13 +120,14 @@ assert.deepStrictEqual(calc(999, 2), {
                                 capture_output=True, text=True, timeout=15, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_album_defaults_to_folder_name_without_confirmation(self):
+    def test_album_requires_explicit_confirmation_before_bulk_upload(self):
         self.store.add_source(str(self.source), "directory")
         self.wait_for_jobs(2)
         source = self.store.sources()[0]
         self.assertEqual(source["album_name"], "source")
-        self.assertEqual(source["album_confirmed"], 1)
-        self.assertIsNotNone(self.store._next_job())
+        self.assertEqual(source["album_confirmed"], 0)
+        self.assertEqual(source["upload_ready"], 0)
+        self.assertIsNone(self.store._next_job())
         with self.assertRaises(UserError):
             self.store.set_album(source["id"], "\ninvalid")
         with self.assertRaises(UserError):
@@ -135,12 +136,78 @@ assert.deepStrictEqual(calc(999, 2), {
         self.assertEqual(self.store.sources()[0]["album_confirmed"], 1)
         self.assertEqual(self.store.sources()[0]["album_name"],
                          "示例旅行相册")
+        self.assertIsNone(self.store._next_job())
+        self.store.set_source_upload(source["id"], True)
         self.assertIsNotNone(self.store._next_job())
         self.assertTrue(any(event["action"] == "album_confirmed"
                             for event in self.store.source_events(source["id"])))
         self.store.upload_enabled = True
         with self.assertRaises(UserError):
             self.store.set_album(source["id"], "Changed While Uploading")
+
+    def test_global_sync_never_auto_uploads_a_new_unapproved_source(self):
+        """New folders remain safe even when the global switch was already ON."""
+        self.store.add_source(str(self.source), "directory")
+        self.wait_for_jobs(2)
+        source_id = self.store.sources()[0]["id"]
+        with mock.patch.object(self.store, "_ensure_upload_ready"):
+            self.store.set_auto_sync(True)
+        self.assertIsNone(self.store._next_job())
+        self.assertEqual(self.store.sources()[0]["upload_ready"], 0)
+        # Filename defaults are only a suggestion, not an album confirmation.
+        with self.assertRaises(UserError):
+            self.store.set_source_upload(source_id, True)
+        # Configure a source while global sync is on. No other source should block settings.
+        self.store.set_album(source_id, "手工确认的相册")
+        self.store.set_upload_quality(source_id, "original")
+        self.assertIsNone(self.store._next_job())
+        self.store.set_source_upload(source_id, True)
+        self.assertIsNotNone(self.store._next_job())
+        self.store.set_source_upload(source_id, False)
+        self.assertIsNone(self.store._next_job())
+        self.assertEqual(self.store.sources()[0]["upload_quality"], "original")
+        self.store.set_auto_sync(False)
+        self.assertFalse(self.store.status()["auto_sync_requested"])
+        other = Store(self.base / "state", worker=False)
+        try:
+            self.assertFalse(other.auto_sync_requested)
+            self.assertFalse(other.upload_enabled)
+            self.assertEqual(other.sources()[0]["upload_ready"], 0)
+            self.assertEqual({j["status"] for j in other.jobs()}, {"queued"})
+        finally:
+            other.close()
+
+    def test_readding_or_restoring_source_never_restores_upload_permission(self):
+        self.store.add_source(str(self.source), "directory")
+        self.wait_for_jobs(2)
+        source_id = self.store.sources()[0]["id"]
+        self.store.set_album(source_id, "手工确认的相册")
+        self.store.set_source_upload(source_id, True)
+        self.store.add_source(str(self.source), "directory")
+        self.assertEqual(self.store.sources()[0]["upload_ready"], 0)
+        self.assertEqual(self.store.sources()[0]["album_name"], "手工确认的相册")
+        self.assertEqual(len(self.store.jobs()), 2)
+        self.store.set_source_upload(source_id, True)
+        self.store.set_display(source_id, "removed")
+        self.assertEqual(self.store.sources()[0]["upload_ready"], 0)
+        self.store.restore_source(source_id)
+        self.assertEqual(self.store.sources()[0]["upload_ready"], 0)
+        self.assertEqual(self.store.sources()[0]["album_confirmed"], 1)
+        self.assertEqual({j["status"] for j in self.store.jobs()}, {"queued"})
+
+    def test_source_upload_permission_prevents_duplicate_album_creation(self):
+        self.store.add_source(str(self.source), "directory")
+        self.wait_for_jobs(2)
+        sid = self.store.sources()[0]["id"]
+        self.store.set_album(sid, "准备中的相册")
+        with self.store.connection() as con:
+            con.execute("""UPDATE jobs SET status='api_accepted',media_key='MOCK_CLOUD'
+                           WHERE source_id=? AND id=(SELECT MIN(id) FROM jobs WHERE source_id=?)""",
+                        (sid, sid))
+        with self.assertRaises(UserError):
+            self.store.set_source_upload(sid, True)
+        self.assertFalse(self.store.sources()[0]["upload_ready"])
+        self.assertEqual(sum(j["status"] == "api_accepted" for j in self.store.jobs()), 1)
 
     def test_auto_sync_requires_local_auth_and_restores_explicit_setting(self):
         self.store.add_source(str(self.source), "directory")
@@ -205,13 +272,15 @@ assert.deepStrictEqual(calc(999, 2), {
         self.assertEqual(jobs[str(self.media2)]["status"], "queued")
         self.assertEqual(jobs[str(new_file)]["status"], "queued")
         self.assertEqual(self.store.sources()[0]["id"], source_id)
-        self.assertEqual(self.store.sources()[0]["album_confirmed"], 1)
+        self.assertEqual(self.store.sources()[0]["album_confirmed"], 0)
+        self.assertEqual(self.store.sources()[0]["upload_ready"], 0)
 
     def test_upload_quality_flag_and_history_are_isolated_per_source(self):
         self.store.add_source(str(self.source), "directory")
         self.wait_for_jobs(2)
         source = self.store.sources()[0]
         source_id = source["id"]
+        self.store.set_album(source_id, source["album_name"])
         self.assertEqual(source["upload_quality"], "storage_saver")
         job = self.store.jobs()[0]
         with mock.patch("webui.server.subprocess.run",
@@ -231,6 +300,7 @@ assert.deepStrictEqual(calc(999, 2), {
         self.assertTrue(ok)
         self.assertNotIn("--saver", run.call_args.args[0])
         self.assertNotIn("--use-quota", run.call_args.args[0])
+        self.store.set_source_upload(source_id, True)
         self.store.upload_enabled = True
         with self.assertRaises(UserError):
             self.store.set_upload_quality(source_id, "storage_saver")
@@ -283,6 +353,7 @@ assert.deepStrictEqual(calc(999, 2), {
         self.media2.write_bytes(b"B" * 15000)
         self.store.add_source(str(self.source), "directory")
         self.wait_for_jobs(2)
+        self.store.set_album(self.store.sources()[0]["id"], "source")
         album_key = "AF1Qip" + "K" * 36
         self.store.allow_upload = True
         self.store.cli = self.base / "fake_cli"
@@ -327,6 +398,7 @@ assert.deepStrictEqual(calc(999, 2), {
         key = "AF1Qip" + "Z" * 36
         self.store.bind_album(source_id, "https://photos.google.com/album/" + key)
         self.assertEqual(self.store.sources()[0]["album_key"], key)
+        self.store.set_source_upload(source_id, True)
         self.assertIsNotNone(self.store._next_job())
         with self.assertRaises(UserError):
             self.store.set_album(source_id, "different album")
@@ -339,6 +411,7 @@ assert.deepStrictEqual(calc(999, 2), {
         self.media2.write_bytes(b"B" * 15000)
         self.store.add_source(str(self.source), "directory")
         self.wait_for_jobs(2)
+        self.store.set_album(self.store.sources()[0]["id"], "source")
         self.store.allow_upload = True
         self.store.cli = self.base / "fake_cli"
         self.store.cli.write_bytes(b"FAKE")
@@ -420,6 +493,7 @@ assert.deepStrictEqual(calc(999, 2), {
         self.store.add_source(str(self.source), "directory")
         self.wait_for_jobs(2)
         self.store.set_album(self.store.sources()[0]["id"], "Mock Album")
+        self.store.set_source_upload(self.store.sources()[0]["id"], True)
         self.store.allow_upload = True
         self.store.cli = self.base / "mock_cli_binary"
         self.store.cli.write_bytes(b"dummy")
@@ -448,6 +522,7 @@ assert.deepStrictEqual(calc(999, 2), {
         self.store.add_source(str(self.media1), "file")
         self.wait_for_jobs(1)
         self.store.set_album(self.store.sources()[0]["id"], "Mock Album")
+        self.store.set_source_upload(self.store.sources()[0]["id"], True)
         self.store.allow_upload = True
         self.store.cli = self.base / "cli"
         self.store.cli.write_bytes(b"mock")
@@ -581,6 +656,16 @@ assert.deepStrictEqual(calc(999, 2), {
         self.assertEqual(status, 200)
         self.assertEqual(self.store.sources()[0]["album_name"], "旅行相册")
         self.assertEqual(self.store.sources()[0]["album_confirmed"], 1)
+        status, permission = req("POST", "/api/source/upload",
+                                 {"id": source_id, "enabled": True},
+                                 {"X-GU-CSRF": token})
+        self.assertEqual(status, 200)
+        self.assertTrue(next(x for x in permission["sources"] if x["id"] == source_id)["upload_ready"])
+        status, permission = req("POST", "/api/source/upload",
+                                 {"id": source_id, "enabled": False},
+                                 {"X-GU-CSRF": token})
+        self.assertEqual(status, 200)
+        self.assertFalse(next(x for x in permission["sources"] if x["id"] == source_id)["upload_ready"])
         with self.store.connection() as con:
             con.execute("UPDATE jobs SET status='api_accepted' WHERE id=?", (job_id,))
         status, _ = req("POST", "/api/cloud/verify", {"id": job_id, "verified": True},

@@ -126,6 +126,7 @@ class Store:
                 path TEXT NOT NULL UNIQUE,
                 kind TEXT NOT NULL CHECK(kind IN ('directory','file')),
                 enabled INTEGER NOT NULL DEFAULT 1,
+                upload_ready INTEGER NOT NULL DEFAULT 0,
                 added_at TEXT NOT NULL,
                 archived INTEGER NOT NULL DEFAULT 0,
                 location_kind TEXT NOT NULL DEFAULT 'local',
@@ -195,6 +196,7 @@ class Store:
               );
             """)
             source_cols = {
+                "upload_ready": "INTEGER NOT NULL DEFAULT 0",
                 "archived": "INTEGER NOT NULL DEFAULT 0",
                 "location_kind": "TEXT NOT NULL DEFAULT 'local'",
                 "mount_root": "TEXT NOT NULL DEFAULT ''",
@@ -410,6 +412,7 @@ class Store:
                        (SELECT COUNT(*) FROM jobs j WHERE j.source_id=s.id AND j.media_kind='image') AS images,
                        (SELECT COUNT(*) FROM jobs j WHERE j.source_id=s.id AND j.media_kind='video') AS videos,
                        (SELECT COUNT(*) FROM jobs j WHERE j.source_id=s.id AND j.status='api_accepted') AS api_accepted,
+                       (SELECT COUNT(*) FROM jobs j WHERE j.source_id=s.id AND j.status='uploading') AS uploading,
                        (SELECT COUNT(*) FROM jobs j WHERE j.source_id=s.id AND j.cloud_verified_at!='') AS cloud_verified
                        FROM sources s WHERE (?=1 OR s.ui_visibility='visible')
                        ORDER BY s.archived,s.id DESC""", (int(include_hidden),))]
@@ -434,13 +437,13 @@ class Store:
         if (not isinstance(title, str) or not 1 <= len(title.strip()) <= 120 or
                 title != title.strip() or any(ord(c) < 32 or ord(c) == 127 for c in title)):
             raise UserError("相册名称必须为 1–120 个非控制字符，不能有首尾空格")
-        if self.upload_enabled:
-            raise UserError("请先关闭真实上传开关，然后再调整相册名称")
         with self.connection() as con:
-            source = con.execute("SELECT id,album_name,album_key FROM sources WHERE id=?",
+            source = con.execute("SELECT id,album_name,album_key,upload_ready FROM sources WHERE id=?",
                                  (int(source_id),)).fetchone()
             if not source:
                 raise UserError("来源不存在")
+            if self.upload_enabled and source["upload_ready"]:
+                raise UserError("请先暂停此来源的上传，再修改相册名称")
             if con.execute("""SELECT 1 FROM jobs WHERE source_id=? AND status='uploading'
                               LIMIT 1""", (int(source_id),)).fetchone():
                 raise UserError("来源有进行中的上传，请在结束后修改相册")
@@ -469,14 +472,14 @@ class Store:
     def bind_album(self, source_id, album_ref):
         """Explicitly reuse an existing album. Never moves or deletes cloud media."""
         key = self._album_key(album_ref)
-        if self.upload_enabled:
-            raise UserError("请先停止自动同步，再绑定相册")
         with self.connection() as con:
             source = con.execute(
-                "SELECT id,album_name,album_key FROM sources WHERE id=?",
+                "SELECT id,album_name,album_key,upload_ready FROM sources WHERE id=?",
                 (int(source_id),)).fetchone()
             if not source or not source["album_name"]:
                 raise UserError("请先设置相册名称")
+            if self.upload_enabled and source["upload_ready"]:
+                raise UserError("请先暂停此来源的上传，再绑定相册")
             if con.execute("""SELECT 1 FROM jobs WHERE source_id=? AND status='uploading'
                               LIMIT 1""", (int(source_id),)).fetchone():
                 raise UserError("等待当前文件上传完成后再绑定相册")
@@ -493,13 +496,13 @@ class Store:
         """Change the upload quality for future media only."""
         if quality not in ("storage_saver", "original"):
             raise UserError("仅支持 Storage saver 或 Original quality")
-        if self.upload_enabled:
-            raise UserError("请先停止自动同步，再调整画质")
         with self.connection() as con:
-            source = con.execute("SELECT upload_quality FROM sources WHERE id=?",
+            source = con.execute("SELECT upload_quality,upload_ready FROM sources WHERE id=?",
                                  (int(source_id),)).fetchone()
             if not source:
                 raise UserError("来源不存在")
+            if self.upload_enabled and source["upload_ready"]:
+                raise UserError("请先暂停此来源的上传，再调整画质")
             if con.execute("""SELECT 1 FROM jobs WHERE source_id=? AND status='uploading'
                               LIMIT 1""", (int(source_id),)).fetchone():
                 raise UserError("当前文件正在上传，请上传结束后再修改画质")
@@ -522,7 +525,7 @@ class Store:
             elif mode == "removed":
                 # Detach source without touching any job's progress or its files.
                 con.execute("""UPDATE sources SET ui_visibility='removed',archived=1,
-                               enabled=0,availability='archived',last_checked_at=? WHERE id=?""",
+                               enabled=0,upload_ready=0,availability='archived',last_checked_at=? WHERE id=?""",
                             (now(), int(source_id)))
             else:
                 con.execute("UPDATE sources SET ui_visibility=? WHERE id=?",
@@ -624,10 +627,10 @@ class Store:
             prior = con.execute("SELECT id,archived,ui_visibility FROM sources WHERE path=?",
                                 (path,)).fetchone()
             con.execute("""INSERT INTO sources
-                           (path,kind,enabled,added_at,archived,location_kind,mount_root,availability,last_checked_at)
-                           VALUES(?,?,1,?,0,?,?, 'online',?)
+                           (path,kind,enabled,upload_ready,added_at,archived,location_kind,mount_root,availability,last_checked_at)
+                           VALUES(?,?,1,0,?,0,?,?, 'online',?)
                            ON CONFLICT(path) DO UPDATE SET
-                           kind=excluded.kind,enabled=1,archived=0,ui_visibility='visible',
+                           kind=excluded.kind,enabled=1,upload_ready=0,archived=0,ui_visibility='visible',
                            location_kind=excluded.location_kind,mount_root=excluded.mount_root,
                            availability='unknown',last_checked_at=excluded.last_checked_at""",
                         (path, kind, now(), "network" if matched else "local",
@@ -635,10 +638,8 @@ class Store:
             source = con.execute("SELECT id FROM sources WHERE path=?", (path,)).fetchone()
             con.execute("""UPDATE sources SET album_name=? WHERE id=? AND album_name=''""",
                         (Path(path).name, source["id"]))
-            # The folder name is a usable album name. New or re-added sources
-            # never require a second confirmation click just to start syncing.
-            con.execute("""UPDATE sources SET album_confirmed=1,album_confirmed_at=?
-                           WHERE id=? AND album_confirmed=0""", (now(), source["id"]))
+            # A suggested folder name is not consent to upload. A new source
+            # must confirm its album and enable uploading explicitly.
             # Explicit re-addition resumes saved paused tasks, preserving
             # accepted, duplicate, failed and manually-verified history.
             if prior:
@@ -661,7 +662,7 @@ class Store:
                 raise UserError("该来源不存在")
             if remove:
                 # Backwards-compatible 'remove' means remove only from WebUI.
-                con.execute("""UPDATE sources SET archived=1,enabled=0,
+                con.execute("""UPDATE sources SET archived=1,enabled=0,upload_ready=0,
                                ui_visibility='removed',availability='archived',
                                last_checked_at=? WHERE id=?""",
                             (now(), source_id))
@@ -671,12 +672,10 @@ class Store:
                     raise UserError("此来源已归档，请先恢复历史来源")
                 con.execute("UPDATE sources SET enabled=? WHERE id=?", (int(enabled), source_id))
                 if not enabled:
+                    con.execute("UPDATE sources SET upload_ready=0 WHERE id=?", (source_id,))
                     con.execute("""UPDATE jobs SET status='paused',updated_at=?
                                    WHERE source_id=? AND status IN ('queued','retrying')""", (now(), source_id))
                 else:
-                    con.execute("""UPDATE sources SET album_confirmed=1,album_confirmed_at=?
-                                   WHERE id=? AND album_confirmed=0 AND album_name!=''""",
-                                (now(), source_id))
                     con.execute("""UPDATE jobs SET status='queued',updated_at=?
                                    WHERE source_id=? AND status='paused'""", (now(), source_id))
         if enabled:
@@ -692,12 +691,9 @@ class Store:
         # merely because the user opened its historical index.
         self._path(row["path"], kind=row["kind"])
         with self.connection() as con:
-            con.execute("""UPDATE sources SET archived=0,enabled=1,ui_visibility='visible',
+            con.execute("""UPDATE sources SET archived=0,enabled=1,upload_ready=0,ui_visibility='visible',
                            availability='unknown',
                            last_checked_at=? WHERE id=?""", (now(), source_id))
-            con.execute("""UPDATE sources SET album_confirmed=1,album_confirmed_at=?
-                           WHERE id=? AND album_confirmed=0 AND album_name!=''""",
-                        (now(), source_id))
             con.execute("""UPDATE jobs SET status='queued',updated_at=?
                            WHERE source_id=? AND status='paused'""", (now(), source_id))
             self._event(con, source_id, "restored", "保留既有媒体索引和上传状态")
@@ -909,7 +905,7 @@ class Store:
         self.wake_event.set()
 
     def set_auto_sync(self, enabled):
-        """Persist one start/stop action for scanning and uploading registered sources."""
+        """Global start/stop; only explicitly approved sources may upload."""
         enabled = bool(enabled)
         if enabled:
             self._ensure_upload_ready()
@@ -917,13 +913,6 @@ class Store:
             con.execute("""INSERT INTO settings(key,value) VALUES('auto_sync',?)
                            ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
                         ("1" if enabled else "0",))
-            if enabled:
-                # Assign a sensible default to old active sources; archived and
-                # manually paused mappings stay disabled until explicitly resumed.
-                con.execute("""UPDATE sources SET album_confirmed=1,
-                               album_confirmed_at=?
-                               WHERE enabled=1 AND archived=0 AND
-                               album_confirmed=0 AND album_name!=''""", (now(),))
         self.auto_sync_requested = enabled
         self.monitor_enabled = enabled
         self.upload_enabled = enabled
@@ -931,6 +920,30 @@ class Store:
             self.request_scan()
         # A stop prevents the NEXT file; an in-flight file may finish safely.
         self.wake_event.set()
+
+    def set_source_upload(self, source_id, enabled):
+        """Explicit, persistent upload permission for one source only."""
+        with self.connection() as con:
+            source = con.execute("""SELECT id,enabled,archived,ui_visibility,
+                                   album_confirmed,album_name,album_key
+                                   FROM sources WHERE id=?""", (int(source_id),)).fetchone()
+            if not source:
+                raise UserError("来源不存在")
+            if enabled:
+                if not source["enabled"] or source["archived"] or source["ui_visibility"] != "visible":
+                    raise UserError("请先恢复并显示来源，再允许上传")
+                if not source["album_confirmed"] or not source["album_name"]:
+                    raise UserError("请先保存并确认相册名称，然后选择画质")
+                prior = con.execute("""SELECT 1 FROM jobs WHERE source_id=?
+                        AND status='api_accepted' LIMIT 1""", (int(source_id),)).fetchone()
+                if prior and not source["album_key"]:
+                    raise UserError("已有上传记录但云端相册 ID 未绑定，禁止创建重复相册")
+            con.execute("UPDATE sources SET upload_ready=? WHERE id=?",
+                        (int(bool(enabled)), int(source_id)))
+            self._event(con, int(source_id), "upload_approved" if enabled else "upload_paused",
+                        "用户明确允许上传" if enabled else "用户暂停来源上传；保留队列")
+        self.wake_event.set()
+        return self.sources()
 
     def _auth_ready(self):
         return (self.allow_upload and self.cli.is_file() and self.credentials.is_file()
@@ -970,7 +983,7 @@ class Store:
                            updated_at=? WHERE id=?""", (now(), job_id))
         self.wake_event.set()
 
-    def _next_job(self, *, source_id=None, image_only=False):
+    def _next_job(self, *, source_id=None, image_only=False, allow_unready=False):
         args = [time.time()]
         condition = ""
         if source_id is not None:
@@ -978,6 +991,8 @@ class Store:
             args.append(int(source_id))
         if image_only:
             condition += " AND j.media_kind='image'"
+        if not allow_unready:
+            condition += " AND s.upload_ready=1"
         ordering = "j.bytes ASC,j.id ASC" if image_only else "j.id ASC"
         with self.connection() as con:
             return con.execute("""SELECT j.* FROM jobs j
@@ -1049,7 +1064,8 @@ class Store:
         except UserError:
             self.upload_enabled = False
             return False
-        job = self._next_job(source_id=source_id, image_only=image_only)
+        job = self._next_job(source_id=source_id, image_only=image_only,
+                             allow_unready=manual)
         if job is None:
             return False
         with self.connection() as con:
@@ -1112,7 +1128,7 @@ class Store:
             raise UserError("来源不存在或已经暂停")
         if not source["album_confirmed"]:
             raise UserError("请先确认相册名称，再进行单张测试")
-        job = self._next_job(source_id=source_id, image_only=True)
+        job = self._next_job(source_id=source_id, image_only=True, allow_unready=True)
         if not job:
             raise UserError("没有可用的未上传照片可测试；请检查磁盘和队列状态")
         # Single synchronous attempt only; never launches a 217-item batch.
@@ -1272,6 +1288,9 @@ def make_handler(store):
                 elif uri == "/api/source/quality":
                     result = {"sources": store.set_upload_quality(
                         int(payload["id"]), payload.get("quality"))}
+                elif uri == "/api/source/upload":
+                    result = {"sources": store.set_source_upload(
+                        int(payload["id"]), payload.get("enabled") is True)}
                 elif uri == "/api/source/test-upload":
                     result = {"test": store.test_one_image(int(payload["id"]))}
                 elif uri == "/api/source/restore":
