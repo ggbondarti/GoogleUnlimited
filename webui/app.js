@@ -305,15 +305,15 @@ function renderSources(sources) {
     const qualityLabel = element("label", "source-quality-label", "后续上传画质");
     const qualitySelect = element("select", "source-quality-select");
     for (const choice of [
-      {value: "storage_saver", text: "Storage saver（默认，节省空间）"},
-      {value: "original", text: "Original quality（原始画质）"}
+      {value: "original", text: "Original quality（默认，原始画质）"},
+      {value: "storage_saver", text: "Storage saver（节省空间）"}
     ]) {
       const option = document.createElement("option");
       option.value = choice.value;
       option.textContent = choice.text;
       qualitySelect.appendChild(option);
     }
-    qualitySelect.value = source.upload_quality || "storage_saver";
+    qualitySelect.value = source.upload_quality || "original";
     qualitySelect.disabled = !!source.uploading ||
       (!!source.upload_ready && !!currentStatus?.upload_enabled);
     qualitySelect.title = "来源正在实际上传时请先点击“暂停此来源上传”";
@@ -321,7 +321,7 @@ function renderSources(sources) {
       const next = qualitySelect.value;
       if (next === "original" && !confirm(
         "原画质可能占用 Google 账号空间。只影响未上传的文件，建议先单张试传核对配额。确认切换吗？")) {
-        qualitySelect.value = source.upload_quality || "storage_saver";
+        qualitySelect.value = source.upload_quality || "original";
         return;
       }
       qualitySelect.disabled = true;
@@ -331,7 +331,7 @@ function renderSources(sources) {
           "，只影响未上传的文件。", true);
         await refresh();
       } catch (error) {
-        qualitySelect.value = source.upload_quality || "storage_saver";
+        qualitySelect.value = source.upload_quality || "original";
         qualitySelect.disabled = false;
         notice(error.message);
       }
@@ -345,17 +345,25 @@ function renderSources(sources) {
     test.title = !source.album_confirmed ? "请先确认相册名称" :
       !currentStatus?.credentials_present ? "请先在 Mac 本机完成独立账号授权" :
       !currentStatus?.allow_real_upload ? "需以 --allow-real-upload 重启 WebUI" :
-      currentStatus?.upload_enabled ? "请先关闭批量上传开关" : "只上传最小的一张未上传照片";
+      currentStatus?.upload_enabled ? "请先关闭批量上传开关" : "先找当前来源，已传完则从其他已确认来源选一张，绝不启动批量";
     test.addEventListener("click", async () => {
-      if (!confirm("只从此来源挑选 1 张未上传的照片，使用独立账号上传到相册「" +
-        source.album_name + "」，画质为 " +
-        (source.upload_quality === "original" ? "Original quality（可能占用配额）" : "Storage saver") +
-        "。这会产生真实 Google Photos 网络请求。继续吗？")) return;
       test.disabled = true;
       try {
-        const result = await post("/api/source/test-upload", {id: source.id});
+        const preview = await get("/api/source/test-candidate?source_id=" + encodeURIComponent(source.id));
+        const pick = preview.candidate;
+        const quality = pick.quality === "original" ? "Original quality（可能占用配额）" : "Storage saver";
+        const sourceNote = pick.fallback ?
+          "当前来源没有未上传照片，已从其他来源找到一张。\n" : "";
+        if (!confirm(sourceNote + "测试文件：" + pick.name + "\n目标相册：「" + pick.album +
+            "」\n试传画质：" + quality + "\n只传这一张，不开启批量上传。继续吗？")) {
+          test.disabled = false;
+          return;
+        }
+        const result = await post("/api/source/test-upload",
+                                  {id: source.id, candidate_id: pick.id});
         const job = result.test;
         notice("单张测试结果：" + job.name + " · " + job.status +
+          " · 相册「" + job.album + "」 · " + (job.quality === "original" ? "原始画质" : "节省空间") +
           (job.error ? " · " + job.error : " · 请进入 Google Photos 官方页面核对相册和配额"), true);
         await refresh();
       } catch (error) { notice(error.message); test.disabled = false; }

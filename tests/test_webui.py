@@ -124,6 +124,7 @@ assert.deepStrictEqual(calc(999, 2), {
         self.store.add_source(str(self.source), "directory")
         self.wait_for_jobs(2)
         source = self.store.sources()[0]
+        self.assertEqual(source["upload_quality"], "original")
         self.assertEqual(source["album_name"], "source")
         self.assertEqual(source["album_confirmed"], 0)
         self.assertEqual(source["upload_ready"], 0)
@@ -281,18 +282,8 @@ assert.deepStrictEqual(calc(999, 2), {
         source = self.store.sources()[0]
         source_id = source["id"]
         self.store.set_album(source_id, source["album_name"])
-        self.assertEqual(source["upload_quality"], "storage_saver")
+        self.assertEqual(source["upload_quality"], "original")
         job = self.store.jobs()[0]
-        with mock.patch("webui.server.subprocess.run",
-                        return_value=mock.Mock(returncode=0,
-                                               stdout='{"mediaKey":"TEST"}')) as run:
-            ok, _, _, _ = self.store._run_upload(job)
-        self.assertTrue(ok)
-        self.assertIn("--saver", run.call_args.args[0])
-        self.assertNotIn("--use-quota", run.call_args.args[0])
-        with self.assertRaises(UserError):
-            self.store.set_upload_quality(source_id, "invalid")
-        self.store.set_upload_quality(source_id, "original")
         with mock.patch("webui.server.subprocess.run",
                         return_value=mock.Mock(returncode=0,
                                                stdout='{"mediaKey":"TEST"}')) as run:
@@ -300,6 +291,17 @@ assert.deepStrictEqual(calc(999, 2), {
         self.assertTrue(ok)
         self.assertNotIn("--saver", run.call_args.args[0])
         self.assertNotIn("--use-quota", run.call_args.args[0])
+        with self.assertRaises(UserError):
+            self.store.set_upload_quality(source_id, "invalid")
+        self.store.set_upload_quality(source_id, "storage_saver")
+        with mock.patch("webui.server.subprocess.run",
+                        return_value=mock.Mock(returncode=0,
+                                               stdout='{"mediaKey":"TEST"}')) as run:
+            ok, _, _, _ = self.store._run_upload(job)
+        self.assertTrue(ok)
+        self.assertIn("--saver", run.call_args.args[0])
+        self.assertNotIn("--use-quota", run.call_args.args[0])
+        self.store.set_upload_quality(source_id, "original")
         self.store.set_source_upload(source_id, True)
         self.store.upload_enabled = True
         with self.assertRaises(UserError):
@@ -328,7 +330,7 @@ assert.deepStrictEqual(calc(999, 2), {
         self.assertTrue(ok)
         self.assertEqual(key, "MOCK_MEDIA_KEY")
         args = cmd.call_args.args[0]
-        self.assertIn("--saver", args)
+        self.assertNotIn("--saver", args)
         self.assertEqual(args[args.index("--album") + 1], "旅程测试相册")
         self.assertNotIn("--delete", args)
         self.assertNotIn("--force", args)
@@ -347,6 +349,58 @@ assert.deepStrictEqual(calc(999, 2), {
         self.assertEqual(result["album"], "旅程测试相册")
         self.store._run_upload.assert_called_once()
         self.assertFalse(self.store.upload_enabled)  # Never opens the batch gate.
+
+    def test_single_image_falls_back_to_other_unuploaded_source_without_bulk(self):
+        # Click an already completed source set to Original quality. The only
+        # available photo belongs to another source set to Storage Saver.
+        # Test exactly one source-owned image using the clicked one-shot mode.
+        self.store.add_source(str(self.source), "directory")
+        self.wait_for_jobs(2)
+        first = self.store.sources()[0]["id"]
+        self.store.set_album(first, "已完成的相册")
+        self.store.set_upload_quality(first, "original")
+        with self.store.connection() as con:
+            con.execute("UPDATE jobs SET status='api_accepted' WHERE source_id=?", (first,))
+        other = self.base / "other-source"
+        other.mkdir()
+        photo = other / "ready_photo.jpg"
+        photo.write_bytes(b"R" * 14000)
+        self.store.add_source(str(other), "directory")
+        for _ in range(150):
+            if any(x["path"] == str(photo) for x in self.store.jobs()):
+                break
+            time.sleep(.02)
+        second = next(s for s in self.store.sources() if s["path"] == str(other))["id"]
+        self.store.set_album(second, "另一个相册")
+        self.store.set_upload_quality(second, "storage_saver")  # Explicitly preserve separate source preference.
+        pick = self.store.preview_test_image(first)
+        self.assertTrue(pick["fallback"])
+        self.assertEqual(pick["source_id"], second)
+        self.assertEqual(pick["name"], photo.name)
+        self.assertEqual(pick["album"], "另一个相册")
+        self.assertEqual(pick["quality"], "original")
+        self.store.allow_upload = True
+        self.store.cli = self.base / "fake_cli"
+        self.store.cli.write_bytes(b"MOCK_CLI")
+        self.store.credentials.write_text("FAKE_TOKEN_NOT_A_CREDENTIAL")
+        self.store.credentials.chmod(0o600)
+        with mock.patch.object(self.store, "_ensure_upload_ready"), mock.patch.object(
+            self.store, "_run_upload", return_value=(True,"MOCK_MEDIA","")) as uploader:
+            with self.assertRaises(UserError):
+                self.store.test_one_image(first,expected_job_id=pick["id"]+1)
+            uploader.assert_not_called()
+            result = self.store.test_one_image(first,expected_job_id=pick["id"])
+            uploader.assert_called_once()
+        self.assertEqual(result["status"], "api_accepted")
+        self.assertEqual(result["album"], "另一个相册")
+        self.assertEqual(result["quality"], "original")
+        args,kwargs=uploader.call_args
+        self.assertEqual(args[0]["path"], str(photo))
+        self.assertEqual(kwargs.get("quality_override"), "original")
+        self.assertEqual(next(s for s in self.store.sources() if s["id"]==first)["upload_quality"], "original")
+        self.assertEqual(next(s for s in self.store.sources() if s["id"]==second)["upload_quality"],"storage_saver")
+        self.assertFalse(self.store.upload_enabled)
+        self.assertEqual(sum(j["status"]=="api_accepted" for j in self.store.jobs()),3)
 
     def test_single_cloud_album_reused_across_uploads_and_restart(self):
         """First upload creates a named album; next must use its returned ID."""

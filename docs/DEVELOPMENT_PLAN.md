@@ -358,11 +358,19 @@ bash google-unlimited.sh help
 
 **原画质新测试**：在已绑定现有云端相册的来源，把画质暂时改为 `original` 并仅发起 1 张尚未上传图片（任务 ID 207），得到 `api_accepted`，未添加 `--saver`。随后立即恢复 `storage_saver`，保持批量同步 OFF 等待旧相册归集检查。该结果证明 Original 模式请求可成功提交，不是 Google 官方详情页对最终原画质、实际配额或 Pixel 身份的证明。
 
+
 **无凭据回归**：Python WebUI 31 项测试通过，项目全部 Python 单测 37 项通过，其中新增首次取回并持久化相册 ID、下一项使用相同 ID、历史有成功记录但无 ID 时拒绝继续领取、缺失 albumKeys 时停止后续上传等保护；Python `py_compile`、Node `--check`、`git diff --check` 通过。
 
 **历史归集实测与恢复**：为了不重传原文件，新增独立模块 `engine/album-attach/`（不修改经过哈希固定的 `engine/gotohp-src/`），通过本机编译后的 helper 对已有的 51 个 `mediaKey` 执行向同一个**现有** Google Photos 相册添加成员：先单项验证成功，后续 50 项一次提交成功；工具不创建或删除云端相册，也不重新上传二进制媒体。私有批次 JSON 用完删除，结果仅记录于本地 Git 忽略的 state 数据库/JSON 中。新建的 Original 单张试传任务 207 成功；恢复 Storage saver 后再测试任务 209 成功。引擎一度因临时辅助源码放错位置触发源码哈希门禁拒绝上传，已移到独立目录并重新验证“源码、二进制、构建清单一致”，没有绕过门禁。最终恢复 `/api/sync` 为 ON，WebUI 显示监控 ON、上传 ON、画质 Storage saver、绑定相册 ID；正在运行的 gotohp 进程命令已验证 `--album` 携带相册 ID 而不是同名标题。
 
 **官方云端验收边界**：51 项历史归集是 Google API 成功返回，不代替在 Google Photos 浏览器页面独立核对相册数量与成员；旧的单文件相册全部保留，不自动删除。Original 单张 API 成功也不等于 Google 官方质量标签或免配额结论。
+
+### 9.17 原画质单张核验及默认策略调整（2026-11-15）
+
+- 单张试传修复：原先按钮只在点击来源搜索待上传照片，当该来源已经全部 `api_accepted` 时误报全库无候选；现在先查当前来源，若已完成再从其他已确认来源选择一张。候选预览展示目标相册和画质，上传以固定任务 ID 运行，不能把跨来源照片传错相册或开启整批同步。
+- 本机试传一张 12 MP（4000 × 3000）照片，API 返回 `api_accepted` 和 `mediaKey`；用户随后从 Google Photos 官方媒体详情独立确认 `Backed up`、`Original quality`、`This item doesn't take up space in your account storage`。这是**单条媒体**的核验结果，不是未来全量媒体永远免费或任何第三方设备身份已获认可的保证。
+- 按本次确认，把**新来源默认画质改为 `original`**，上传不添加 `--saver`；既有来源的自定义画质不会被数据库迁移全量覆盖。使用者可随时切回 `storage_saver`；修改只作用于尚未上传的后续媒体，不重新入队历史任务。为了兼容旧 SQLite 的 `DEFAULT storage_saver`，新来源插入时明确指定 `upload_quality='original'`。
+- 开发现场将现有测试来源的未来上传画质设为 Original；仍保持「自动同步」关闭，禁止无意恢复批量上传。README 不公开真实相册名称、原文件路径、用户身份或凭据。
 
 ## 10. 之前阶段待办与交接
 
