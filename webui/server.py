@@ -66,8 +66,9 @@ class Store:
             ROOT / "engine/bin/gotohp-cli-owned-arm64" if engine == "owned"
             else ROOT / "gotohp-cli-macos-universal"))
         self.allow_upload = allow_upload
-        self.upload_enabled = False  # NEVER persist auto-upload across restart
-        self.monitor_enabled = False  # NEVER watch or import user's folders by default
+        self.upload_enabled = False
+        self.monitor_enabled = False
+        self.auto_sync_requested = False
         self.lock = threading.RLock()
         self.scan_lock = threading.Lock()
         self.scan_request_lock = threading.Lock()
@@ -80,6 +81,19 @@ class Store:
         self.stop_event = threading.Event()
         self.wake_event = threading.Event()
         self._initialize()
+        # Only restore an explicitly enabled, locally authorized sync policy.
+        # A user stop remains stopped across service restart and disk remount.
+        with self.connection() as con:
+            setting = con.execute("SELECT value FROM settings WHERE key='auto_sync'").fetchone()
+            self.auto_sync_requested = bool(setting and setting["value"] == "1")
+        if self.auto_sync_requested and worker:
+            try:
+                self._ensure_upload_ready()
+            except UserError:
+                pass  # Fail closed if the account or pinned engine is unavailable.
+            else:
+                self.monitor_enabled = True
+                self.upload_enabled = True
         # Rebuild historical summaries from SQLite alone (no disk or NAS reads).
         with self.connection() as con:
             source_ids = [row["id"] for row in con.execute("SELECT id FROM sources")]
@@ -89,6 +103,8 @@ class Store:
         if worker:
             self.thread = threading.Thread(target=self._worker_loop, daemon=True, name="gu-webui-worker")
             self.thread.start()
+            if self.monitor_enabled:
+                self.request_scan()
 
     @contextmanager
     def connection(self):
@@ -171,6 +187,10 @@ class Store:
               );
               CREATE INDEX IF NOT EXISTS idx_source_events_id
                 ON source_events(source_id,id);
+              CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+              );
             """)
             source_cols = {
                 "archived": "INTEGER NOT NULL DEFAULT 0",
@@ -513,6 +533,8 @@ class Store:
         if self.engine == "owned" and cli_present:
             owned_verified, _ = verify_owned_engine(ROOT)
         return {"monitor_enabled": self.monitor_enabled, "upload_enabled": self.upload_enabled,
+                "auto_sync_enabled": self.monitor_enabled and self.upload_enabled,
+                "auto_sync_requested": self.auto_sync_requested,
                 "allow_real_upload": self.allow_upload, "credentials_present": credentials_present,
                 "cli_present": cli_present, "upload_engine": self.engine,
                 "owned_build_verified": owned_verified,
@@ -551,13 +573,23 @@ class Store:
             source = con.execute("SELECT id FROM sources WHERE path=?", (path,)).fetchone()
             con.execute("""UPDATE sources SET album_name=? WHERE id=? AND album_name=''""",
                         (Path(path).name, source["id"]))
+            # The folder name is a usable album name. New or re-added sources
+            # never require a second confirmation click just to start syncing.
+            con.execute("""UPDATE sources SET album_confirmed=1,album_confirmed_at=?
+                           WHERE id=? AND album_confirmed=0""", (now(), source["id"]))
+            # Explicit re-addition resumes saved paused tasks, preserving
+            # accepted, duplicate, failed and manually-verified history.
+            if prior:
+                con.execute("""UPDATE jobs SET status='queued',updated_at=?
+                               WHERE source_id=? AND status='paused'""",
+                            (now(), source["id"]))
             self._event(con, source["id"],
                         "reload" if prior else "added",
                         "复用原索引与所有备份状态" if prior else "新增来源")
-        # Reload shows existing SQLite history immediately; never rescan
-        # a large share or alter previously accepted/paused jobs automatically.
-        if not prior:
-            self.request_scan()
+        # A re-addition refreshes the known path. Unchanged files are handled
+        # by the cached size/mtime/ctime branch without rehashing the media.
+        self.request_scan()
+        self.wake_event.set()
         return self.sources()
 
     def _set_source(self, source_id, enabled=None, remove=False):
@@ -580,10 +612,14 @@ class Store:
                     con.execute("""UPDATE jobs SET status='paused',updated_at=?
                                    WHERE source_id=? AND status IN ('queued','retrying')""", (now(), source_id))
                 else:
+                    con.execute("""UPDATE sources SET album_confirmed=1,album_confirmed_at=?
+                                   WHERE id=? AND album_confirmed=0 AND album_name!=''""",
+                                (now(), source_id))
                     con.execute("""UPDATE jobs SET status='queued',updated_at=?
                                    WHERE source_id=? AND status='paused'""", (now(), source_id))
         if enabled:
             self.request_scan()
+            self.wake_event.set()
 
     def restore_source(self, source_id):
         with self.connection() as con:
@@ -597,9 +633,14 @@ class Store:
             con.execute("""UPDATE sources SET archived=0,enabled=1,ui_visibility='visible',
                            availability='unknown',
                            last_checked_at=? WHERE id=?""", (now(), source_id))
+            con.execute("""UPDATE sources SET album_confirmed=1,album_confirmed_at=?
+                           WHERE id=? AND album_confirmed=0 AND album_name!=''""",
+                        (now(), source_id))
+            con.execute("""UPDATE jobs SET status='queued',updated_at=?
+                           WHERE source_id=? AND status='paused'""", (now(), source_id))
             self._event(con, source_id, "restored", "保留既有媒体索引和上传状态")
-        if self.monitor_enabled:
-            self.request_scan()
+        self.request_scan()
+        self.wake_event.set()
         return self.sources()
 
     def set_cloud_verified(self, job_id, verified):
@@ -803,6 +844,30 @@ class Store:
         self.monitor_enabled = bool(enabled)
         if enabled:
             self.request_scan()
+        self.wake_event.set()
+
+    def set_auto_sync(self, enabled):
+        """Persist one start/stop action for scanning and uploading registered sources."""
+        enabled = bool(enabled)
+        if enabled:
+            self._ensure_upload_ready()
+        with self.connection() as con:
+            con.execute("""INSERT INTO settings(key,value) VALUES('auto_sync',?)
+                           ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                        ("1" if enabled else "0",))
+            if enabled:
+                # Assign a sensible default to old active sources; archived and
+                # manually paused mappings stay disabled until explicitly resumed.
+                con.execute("""UPDATE sources SET album_confirmed=1,
+                               album_confirmed_at=?
+                               WHERE enabled=1 AND archived=0 AND
+                               album_confirmed=0 AND album_name!=''""", (now(),))
+        self.auto_sync_requested = enabled
+        self.monitor_enabled = enabled
+        self.upload_enabled = enabled
+        if enabled:
+            self.request_scan()
+        # A stop prevents the NEXT file; an in-flight file may finish safely.
         self.wake_event.set()
 
     def _auth_ready(self):
@@ -1126,8 +1191,11 @@ def make_handler(store):
                 elif uri == "/api/monitor":
                     store.set_monitor(payload.get("enabled") is True)
                     result = {"monitor_enabled": store.monitor_enabled}
+                elif uri == "/api/sync":
+                    store.set_auto_sync(payload.get("enabled") is True)
+                    result = {"auto_sync_enabled": store.monitor_enabled and store.upload_enabled}
                 elif uri == "/api/upload":
-                    store.set_upload(payload.get("enabled") is True)
+                    store.set_auto_sync(payload.get("enabled") is True)
                     result = {"upload_enabled": store.upload_enabled}
                 elif uri == "/api/scan":
                     store.request_scan()

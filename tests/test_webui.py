@@ -43,6 +43,8 @@ class WebUITest(unittest.TestCase):
         state = self.store.status()
         self.assertFalse(state["monitor_enabled"])
         self.assertFalse(state["upload_enabled"])
+        self.assertFalse(state["auto_sync_enabled"])
+        self.assertFalse(state["auto_sync_requested"])
         self.assertFalse(state["allow_real_upload"])
         self.assertFalse(state["credentials_present"])
         with self.assertRaises(UserError):
@@ -60,6 +62,9 @@ class WebUITest(unittest.TestCase):
         self.assertIn("grid-template-columns: 42px minmax(0, 1fr) auto", css)
         self.assertIn(".source-album-form", css)
         self.assertIn("source-album-settings", js)
+        self.assertIn('"sync-switch"', js)
+        self.assertNotIn('"monitor-switch"', js)
+        self.assertNotIn('"upload-switch"', js)
         self.assertIn("保存并确认相册", js)
         self.assertIn("仅试传 1 张照片", js)
         self.assertIn(".source-entry > .source-meta", css)
@@ -68,13 +73,13 @@ class WebUITest(unittest.TestCase):
         self.assertIn("grid-template-columns:repeat(2,minmax(0,1fr))", css)
         self.assertIn("engine-state", (base / "index.html").read_text(encoding="utf-8"))
 
-    def test_album_default_requires_explicit_confirmation(self):
+    def test_album_defaults_to_folder_name_without_confirmation(self):
         self.store.add_source(str(self.source), "directory")
         self.wait_for_jobs(2)
         source = self.store.sources()[0]
         self.assertEqual(source["album_name"], "source")
-        self.assertEqual(source["album_confirmed"], 0)
-        self.assertIsNone(self.store._next_job())  # A queued job is not uploadable yet.
+        self.assertEqual(source["album_confirmed"], 1)
+        self.assertIsNotNone(self.store._next_job())
         with self.assertRaises(UserError):
             self.store.set_album(source["id"], "\ninvalid")
         with self.assertRaises(UserError):
@@ -89,6 +94,71 @@ class WebUITest(unittest.TestCase):
         self.store.upload_enabled = True
         with self.assertRaises(UserError):
             self.store.set_album(source["id"], "Changed While Uploading")
+
+    def test_auto_sync_requires_local_auth_and_restores_explicit_setting(self):
+        self.store.add_source(str(self.source), "directory")
+        self.wait_for_jobs(2)
+        with self.assertRaises(UserError):
+            self.store.set_auto_sync(True)
+        self.assertFalse(self.store.auto_sync_requested)
+        self.assertFalse(self.store.upload_enabled)
+        # Simulate the readiness gate; no real credentials or Google requests.
+        with mock.patch.object(self.store, "_ensure_upload_ready"):
+            self.store.set_auto_sync(True)
+        self.assertTrue(self.store.monitor_enabled)
+        self.assertTrue(self.store.upload_enabled)
+        self.assertTrue(self.store.status()["auto_sync_requested"])
+        with mock.patch.object(Store, "_ensure_upload_ready"):
+            restarted = Store(self.base / "state", allow_upload=True, worker=True)
+            try:
+                self.assertTrue(restarted.monitor_enabled)
+                self.assertTrue(restarted.upload_enabled)
+                self.assertTrue(restarted.auto_sync_requested)
+                restarted.set_auto_sync(False)
+                self.assertFalse(restarted.upload_enabled)
+                self.assertFalse(restarted.monitor_enabled)
+            finally:
+                restarted.close()
+        after_stop = Store(self.base / "state", allow_upload=True, worker=False)
+        try:
+            self.assertFalse(after_stop.auto_sync_requested)
+            self.assertFalse(after_stop.monitor_enabled)
+            self.assertFalse(after_stop.upload_enabled)
+        finally:
+            after_stop.close()
+
+    def test_remove_and_readd_scans_new_media_but_keeps_accepted_history(self):
+        self.store.add_source(str(self.source), "directory")
+        self.wait_for_jobs(2)
+        self.store.scan()
+        source_id = self.store.sources()[0]["id"]
+        accepted_id = next(j["id"] for j in self.store.jobs()
+                           if j["path"] == str(self.media1))
+        with self.store.connection() as con:
+            con.execute("UPDATE jobs SET status='api_accepted' WHERE id=?", (accepted_id,))
+        self.store.set_cloud_verified(accepted_id, True)
+        self.store._set_source(source_id, enabled=False)
+        self.store.set_display(source_id, "removed")
+        self.assertIsNone(self.store._next_job())
+        new_file = self.source / "photo C.jpg"
+        new_file.write_bytes(b"C" * 16000)
+        with mock.patch.object(self.store, "_digest", wraps=self.store._digest) as digest:
+            self.store.add_source(str(self.source), "directory")
+            self.wait_for_jobs(3)
+            # Wait until the background scan has finished.
+            with self.store.scan_lock:
+                pass
+            hashed_paths = [str(call.args[0]) for call in digest.call_args_list]
+        self.assertNotIn(str(self.media1), hashed_paths)
+        self.assertNotIn(str(self.media2), hashed_paths)
+        self.assertIn(str(new_file), hashed_paths)
+        jobs = {j["path"]: j for j in self.store.jobs()}
+        self.assertEqual(jobs[str(self.media1)]["status"], "api_accepted")
+        self.assertTrue(jobs[str(self.media1)]["cloud_verified_at"])
+        self.assertEqual(jobs[str(self.media2)]["status"], "queued")
+        self.assertEqual(jobs[str(new_file)]["status"], "queued")
+        self.assertEqual(self.store.sources()[0]["id"], source_id)
+        self.assertEqual(self.store.sources()[0]["album_confirmed"], 1)
 
     def test_cli_album_flag_and_single_image_mode(self):
         self.store.add_source(str(self.source), "directory")
@@ -131,7 +201,7 @@ class WebUITest(unittest.TestCase):
         self.store.set_display(source_id, "removed")
         with mock.patch.object(self.store, "request_scan") as request_scan:
             self.store.add_source(str(self.source), "directory")
-            request_scan.assert_not_called()
+            request_scan.assert_called_once()
         source = self.store.sources()[0]
         self.assertEqual(source["id"], source_id)
         self.assertEqual(source["album_name"], "南宁武汉贵州长白山")
@@ -441,7 +511,7 @@ class WebUITest(unittest.TestCase):
         self.assertTrue(self.media1.exists())
         with mock.patch.object(self.store, "request_scan") as scan_requested:
             self.store.restore_source(source_id)
-            scan_requested.assert_not_called()  # Loading 80+ GB history does not hash files.
+            scan_requested.assert_called_once()  # Incremental scan uses cached metadata.
         self.wait_for_jobs(2)
         self.assertEqual(self.store.sources()[0]["id"], source_id)
         self.assertFalse(self.store.sources()[0]["archived"])
@@ -623,7 +693,7 @@ class WebUITest(unittest.TestCase):
         self.assertEqual(self.store.folders(source_id)[0]["file_count"], 2)
         with mock.patch.object(self.store, "request_scan") as scan:
             self.store.add_source(str(self.source), "directory")
-            scan.assert_not_called()  # No expensive rehash or surprise upload.
+            scan.assert_called_once()  # Incremental scan reuses cached file hashes.
         self.assertEqual(self.store.sources()[0]["id"], source_id)
         self.assertEqual(self.store.sources()[0]["ui_visibility"], "visible")
         self.assertEqual(self.store.jobs_total(), 2)

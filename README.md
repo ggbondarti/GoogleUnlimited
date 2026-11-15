@@ -10,6 +10,20 @@
 >
 > **Development plan & verified progress / 开发进度：** [docs/DEVELOPMENT_PLAN.md](docs/DEVELOPMENT_PLAN.md)
 
+### GoogleUnlimited 一键自动同步（当前使用方式）
+
+**WebUI：** 在 Mac M2 打开 `http://127.0.0.1:8796`。启动服务器需使用自己编译的上传引擎和本地授权：`python3 webui/server.py --port 8796 --engine owned --allow-real-upload`。本机服务仅监听 `127.0.0.1`；其他设备不能用各自的 127.0.0.1 连接此服务。
+
+**日常只有一个「自动同步」开关。** 添加已挂载的硬盘文件夹、SMB/NAS 目录或单文件后，项目自动索引；自动同步运行时直接上传（默认以文件夹名作为相册名，可选修改），**不用再点击确认相册或再次启动上传**。每约 30 秒检查一次已经**明确添加**的目录，不自动上传整个磁盘上未选择的其他目录。
+
+- **停止**：关掉自动同步，立即停止启动新文件，正在上传的当前文件可正常完成；SQLite 所有文件索引、云端接受状态与原照片原封不动。停止状态在服务重启后仍保持。
+- **暂停一个来源**：关闭来源卡片开关；其他来源继续工作，保留暂停媒体状态。打开来源卡片开关后重新扫描并继续。
+- **删除显示 / 移除映射**：此来源禁用并从普通页面移走，保留原盘文件及全部 SQLite 历史，其他来源可继续；如需重新上传，重新添加**同一绝对路径**，或从「显示隐藏记录」选择「重新启用」。
+- **离线 / 重挂载**：已登记的挂载路径断开时保留历史并等待，按原路径重新挂载后自动识别已有任务并扫描新增照片/视频；内容未变化则跳过 SHA-256 重算，已 API 接收的文件不会重传，未完成的继续排队。
+- **重启 Mac / WebUI**：已明确开启的自动同步会持久保存；只有本地授权凭据、自编译引擎校验、`--allow-real-upload` 三个条件均成立才自动恢复。若未授权则安全停止。上传途中意外断电导致的 `interrupted` 文件结果未知，仍需先核对云端才能手动重试，以免重复上传。
+
+可选的单张试传、相册改名、目录详细索引都默认收起；大批量文件不用全部展开。上传成功状态 `api_accepted` 不等于已通过 Google 官方页面独立核验。Google 共享空间用量不增长是可观察的现象，但不能仅据此证明 Google 明确把 gotohp 识别成 Pixel。
+
 ### About this variant / 关于本版本
 
 This repository retains the original project's README, source history and upstream attribution, while adding Mac M2 / ARM64 safeguards and isolated offline diagnostics. Changes include **macOS executable-format validation**, a read-only `audit <directory>` media census, a fix for lost uploader process exit codes, explicit labels for **estimated** rather than Google-confirmed progress, and offline regression coverage.
@@ -28,7 +42,7 @@ bash tests/test_macos_binary_selection.sh
 
 ### Mac M2 独立 Google 账号授权 + Google Photos 相册上传（安全流程）
 
-本项目使用 gotohp v0.11.0 的 **`upload --album "相册名称"`** 参数，将已上传的媒体放入指定 Google Photos 相册（必要时新建相册）。WebUI 为每个**来源目录**维护单独的 `album_name` 和 `album_confirmed`，默认建议使用源文件夹名字；你可以修改后点击“保存并确认相册”。在没有明确确认相册之前，该目录的任务**不会被自动上传**。每个来源的相册设置保留在 SQLite 中，隐藏、移除显示或重新挂载均不会丢失。改变相册名不会自动迁移已上传文件。
+本项目使用 gotohp v0.11.0 的 **`upload --album "相册名称"`** 参数将媒体送入指定 Google Photos 相册。**当前版本默认使用来源文件夹名作为相册名并自动确认**，添加后无需额外确认；如需改名，可先停止自动同步，再展开相册设置修改。SQLite 保留原相册配置及上传进度；更改相册名不会自动移动已上传内容。
 
 **仅在 Mac M2 本机 Chrome 的指定配置文件中由用户本人执行 Google 登录：**
 
@@ -76,7 +90,7 @@ bash tests/test_macos_binary_selection.sh
 
 ### Mac M2 Local WebUI / 本地网页管理
 
-The independent local dashboard resides in webui/, using Python 3 standard library only. It does not mount Android/DCIM and does not read or modify MI3MountMac. It binds exclusively to 127.0.0.1 and both monitoring and upload begin OFF.
+The independent local dashboard resides in webui/, using Python 3 standard library only. It does not mount Android/DCIM and does not read or modify MI3MountMac. It binds exclusively to 127.0.0.1. Auto-sync is restored after restart only when the user previously enabled it and the local credentials, signed local engine and explicit upload runtime gate remain valid.
 
 Start on the Mac M2:
 
@@ -85,9 +99,9 @@ Start on the Mac M2:
 
 Open **http://127.0.0.1:8796** on the same Mac. Click **＋ 添加来源** and choose **本机 / 外接硬盘** or **网络共享 / NAS**. Already mounted SMB/NFS/AFP/WebDAV/SSHFS shares can be browsed like local volumes under `/Volumes`; for a new SMB share, enter `smb://host/share` (without any username or password). The WebUI asks macOS Finder to connect: Finder prompts for authentication, and the WebUI only lists the share after it is mounted. Refresh the network volume list, then choose an entire folder or a single photo/video. No SMB credentials are accepted, transmitted to a custom server, or saved in the WebUI SQLite database.
 
-The **SQLite historical index** is persistent and separate from MI3MountMac. It stores source directories, nested-folder counts, image/video formats, extensions, bytes, file timestamps, SHA-256 content digests, file availability, API upload acceptance, explicit manual cloud-verification date, errors, retry count and queue status. **WebUI display controls are non-destructive:** **隐藏** hides a source from the normal page but leaves its monitor setting unchanged; **删除显示** removes the source card and its visible job/folder details and disables that source mapping, but does **not** delete any original files, jobs, folders, API acceptance flags or manual verification data. Toggle **显示隐藏记录** to view hidden/removed sources or their operation history; re-adding the same mounted path automatically reuses its original SQLite source ID and progress without an automatic bulk rescan or resetting uploads. Both directory and per-file task details are **collapsed by default**; open them only when needed. Hidden and removed sources are excluded from normal-page totals until explicitly shown. Offline or detached network volumes retain historical rows and can be rescanned after reconnect. A crash during upload leaves **interrupted / needs manual review** rather than silently retrying. The queue is filterable and paginated. These UI actions never delete underlying files.
+The **SQLite historical index** is persistent and separate from MI3MountMac. It stores source directories, nested-folder counts, image/video formats, extensions, bytes, file timestamps, SHA-256 content digests, file availability, API upload acceptance, explicit manual cloud-verification date, errors, retry count and queue status. **WebUI display controls are non-destructive:** **隐藏** hides a source from the normal page but leaves its monitor setting unchanged; **删除显示** removes the source card and its visible job/folder details and disables that source mapping, but does **not** delete any original files, jobs, folders, API acceptance flags or manual verification data. Toggle **显示隐藏记录** to view hidden/removed sources or their operation history; re-adding the same mounted path automatically reuses its original SQLite source ID and progress, then incrementally scans for new files without rehashing unchanged media or resetting accepted uploads. Both directory and per-file task details are **collapsed by default**; open them only when needed. Hidden and removed sources are excluded from normal-page totals until explicitly shown. Offline or detached network volumes retain historical rows and can be rescanned after reconnect. A crash during upload leaves **interrupted / needs manual review** rather than silently retrying. The queue is filterable and paginated. These UI actions never delete underlying files.
 
-Accepted media include images such as JPG/JPEG, PNG, HEIC/HEIF, WebP, TIFF, AVIF, DNG and major RAW camera extensions, and video such as MP4, MOV, MKV, AVI, M4V, WebM, MPEG and MTS. Minimum indexed size: 10 KB. Adding a new source scans and queues eligible media; the separate monitor toggle discovers later changes every 30 seconds. The UI provides pause/resume, content-hash deduplication, failure/retry counts, manual retries and status refresh.
+Accepted media include images such as JPG/JPEG, PNG, HEIC/HEIF, WebP, TIFF, AVIF, DNG and major RAW camera extensions, and video such as MP4, MOV, MKV, AVI, M4V, WebM, MPEG and MTS. Minimum indexed size: 10 KB. Adding a new source scans and queues eligible media; the single auto-sync switch discovers new items every 30 seconds and uploads them when running. The UI provides per-source pause/resume, content-hash deduplication, failure/retry counts, manual retries and status refresh.
 
 **Real uploads are disabled by default.** When ready to test with an independently authorized Google account (NOT the Xiaomi 3 account), use a dedicated credential file in webui/state/gotohp.config and explicitly enable the runtime gate. Example local commands (never paste cookies into chat or GitHub):
 

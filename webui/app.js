@@ -96,7 +96,7 @@ function renderSources(sources) {
   const target = $("sources-list");
   clear(target);
   if (!sources.length) {
-    target.appendChild(element("div", "empty", "尚无来源。添加文件夹或单个文件后自动扫描并保留历史索引。"));
+    target.appendChild(element("div", "empty", "还没有添加文件夹。添加后自动扫描；同步运行时直接上传，历史永久保留。"));
     return;
   }
   for (const source of sources) {
@@ -118,12 +118,15 @@ function renderSources(sources) {
     sourcePath.title = source.path; // truncated long paths remain inspectable.
     info.appendChild(sourcePath);
     info.appendChild(element("small", "source-badges", badges.join(" · ")));
+    const uploaded = source.api_accepted || 0;
+    const all = source.indexed_files || 0;
+    const pct = all ? Math.round(uploaded * 100 / all) : 0;
     info.appendChild(element("small", "source-badges",
-      "已索引 " + source.indexed_files + " 项（图片 " + source.images + " / 视频 " + source.videos +
-      "）· API 已接收 " + source.api_accepted + " · 云端人工核验 " + source.cloud_verified));
+      "已发现 " + all + " 项（照片 " + source.images + " / 视频 " + source.videos +
+      "） · 已接收 " + uploaded + " / " + all + " · " + pct + "% · 云端核验 " + source.cloud_verified));
     info.appendChild(element("small", "source-album-caption",
       "Google Photos 相册：" + (source.album_name || "尚未设定") +
-      (source.album_confirmed ? " · 已确认" : " · 待确认，禁止上传")));
+      (source.album_confirmed ? "" : " · 添加此来源后自动使用该名称")));
     row.appendChild(info);
     // Keep every action inside ONE grid cell. Previously they were siblings of
     // the text column and a full-width <details>; flexbox compressed the path
@@ -140,11 +143,18 @@ function renderSources(sources) {
       $("index").scrollIntoView({behavior: "smooth", block: "start"});
     });
     controls.appendChild(index);
-    if (source.ui_visibility !== "visible") {
+    if (source.ui_visibility === "removed") {
+      const restore = element("button", "btn primary", "重新启用");
+      restore.title = "已挂载时单击恢复，接着上传未完成文件；不重传已接收的内容";
+      restore.addEventListener("click", () =>
+        action("/api/source/restore", {id: source.id},
+          "映射已恢复，保留原进度；自动同步运行时继续上传"));
+      controls.appendChild(restore);
+    } else if (source.ui_visibility === "hidden") {
       const show = element("button", "btn soft", "显示");
       show.addEventListener("click", () =>
         action("/api/source/display", {id: source.id, mode: "visible"},
-          "已恢复界面显示，历史索引及备份状态没有改变"));
+          "已恢复显示，备份与同步设置保持不变"));
       controls.appendChild(show);
     } else if (source.archived) {
       const restore = element("button", "btn primary", "恢复历史");
@@ -166,7 +176,7 @@ function renderSources(sources) {
     }
     if (source.ui_visibility === "visible") {
       const hide = element("button", "btn soft", "隐藏");
-      hide.title = "只隐藏页面显示，不改变监控和 SQLite 任务状态";
+      hide.title = "只整理界面，不暂停同步、不更改媒体历史";
       hide.addEventListener("click", () => {
         collapseHiddenSourceDetails(source.id);
         action("/api/source/display", {id: source.id, mode: "hidden"},
@@ -174,12 +184,12 @@ function renderSources(sources) {
       });
       controls.appendChild(hide);
       const remove = element("button", "btn warn", "删除显示");
-      remove.title = "移除本页映射并停止来源监控；不删除数据库及照片";
+      remove.title = "停止此来源并移除映射；保留照片、SQLite 和已上传历史";
       remove.addEventListener("click", () => {
-        if (confirm("只从 WebUI 删除显示并停止这条来源映射；不删除 SQLite 历史、上传进度或任何照片。确定吗？")) {
+        if (confirm("停止此来源并移除映射？不删除任何照片、数据库或上传进度。")) {
           collapseHiddenSourceDetails(source.id);
           action("/api/source/display", {id: source.id, mode: "removed"},
-            "已从界面移除。SQLite 历史仍然保留，重新添加相同目录即可恢复");
+            "已停止该来源并保存全部进度，重新添加相同目录即可继续");
         }
       });
       controls.appendChild(remove);
@@ -206,7 +216,7 @@ function renderSources(sources) {
     row.appendChild(events);
 
     const album = element("details", "source-album-settings");
-    const summary = element("summary", null, "相册名称与单张试传");
+    const summary = element("summary", null, "相册名称（可选修改）与单张试传");
     album.appendChild(summary);
     const albumBody = element("div", "source-album-form");
     const input = element("input", "album-name-input");
@@ -225,7 +235,7 @@ function renderSources(sources) {
         const result = await post("/api/source/album",
           {id: source.id, album_name: input.value});
         albumDrafts.delete(source.id);
-        notice("已确认相册：" + input.value + "。历史文件不会自动重传。", true);
+        notice("已保存相册名：" + input.value + "。已上传文件不重新传。", true);
         await refresh();
       } catch (error) { notice(error.message); }
     });
@@ -252,7 +262,7 @@ function renderSources(sources) {
     });
     albumBody.appendChild(test);
     albumBody.appendChild(element("small", "source-album-hint",
-      "先确认名称，再执行单张测试。API 接收不等于官方云端核验，修改名称不会自动移动此前上传的文件。"));
+      "默认使用文件夹名称，添加后直接同步。需要改名时先停止自动同步；修改名称不会移动已上传照片。"));
     album.appendChild(albumBody);
     album.addEventListener("toggle", () => {
       if (album.open) expandedAlbumSources.add(source.id);
@@ -426,18 +436,19 @@ async function refresh() {
       renderJobs(tasks.jobs);
       renderPagination(tasks);
     }
-    $("monitor-switch").checked = status.monitor_enabled;
-    $("upload-switch").checked = status.upload_enabled;
+    $("sync-switch").checked = !!status.auto_sync_enabled;
     $("credential-state").textContent = status.credentials_present
       ? "存在本机凭据（有效性未验证）" : "尚未配置独立账号";
     $("engine-state").textContent = status.upload_engine === "owned"
       ? (status.owned_build_verified ? "自行编译 · SHA 校验通过" : "自行编译 · 尚未通过构建验证")
       : "第三方发行版 · 固定 SHA-256";
-    $("upload-reason").textContent = status.allow_real_upload
-      ? (status.credentials_present ? "独立凭据存在，可手动启动或停止" : "缺少独立凭据，无法上传")
-      : "安全锁定：需在本机启动参数显式启用上传";
+    $("upload-reason").textContent = status.auto_sync_enabled
+      ? "自动扫描并上传已添加的来源；断开硬盘保留记录，重挂载后接着上传。"
+      : (status.allow_real_upload && status.credentials_present
+        ? "已停止，记录保留。开启后自动检查并继续；正在传输的文件可正常结束。"
+        : "尚未完成本机账号授权或上传引擎未就绪。");
     $("scan-label").textContent = status.scan_running
-      ? "正在扫描" : (status.monitor_enabled ? "监控已启用" : "监控已关闭");
+      ? "正在检查新文件" : (status.auto_sync_enabled ? "自动同步中" : "已停止");
     $("last-scan").textContent = status.last_scan
       ? "最近扫描：" + status.last_scan + (status.last_scan_error ? " · " + status.last_scan_error : "")
       : "尚未扫描";
@@ -545,7 +556,9 @@ async function addSource() {
   try {
     await post("/api/sources", {kind: type, path});
     $("source-dialog").close();
-    notice("已添加 / 恢复来源。已索引的任务进度会保留，不会自动开始真实云端上传。", true);
+    notice(currentStatus?.auto_sync_enabled
+      ? "已添加 / 恢复来源，自动扫描并续传。已上传的文件不会重复上传。"
+      : "已添加 / 恢复来源，历史保留；启动自动同步即可上传。", true);
     await refresh();
   } catch (error) {
     $("browser-items").replaceChildren(element("div", "empty", error.message));
@@ -596,12 +609,10 @@ document.addEventListener("DOMContentLoaded", () => {
   for (const select of ["job-source-filter", "job-kind-filter", "job-status-filter"]) {
     $(select).addEventListener("change", () => { pageOffset = 0; refresh(); });
   }
-  $("monitor-switch").addEventListener("change", e =>
-    action("/api/monitor", {enabled: e.target.checked},
-      e.target.checked ? "目录监控已启动（并非真实上传）" : "目录监控已关闭"));
-  $("upload-switch").addEventListener("change", e =>
-    action("/api/upload", {enabled: e.target.checked},
-      e.target.checked ? "已启用独立账号上传" : "真实上传已停止"));
+  $("sync-switch").addEventListener("change", e =>
+    action("/api/sync", {enabled: e.target.checked},
+      e.target.checked ? "自动同步已启动：新文件直接进入上传队列" :
+        "已停止自动扫描和后续上传，历史仍保留"));
   for (const button of document.querySelectorAll('input[name="kind"]')) {
     button.addEventListener("change", e => {
       modalKind = e.target.value;
