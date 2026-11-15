@@ -321,7 +321,9 @@ bash google-unlimited.sh help
 
 **验证边界**：当前 Chrome 测试账号的共享存储在已上传照片/视频后仍显示 **88.8 MB** 是值得持续观察的实测现象，但该指标是整个 Google 账号 Gmail/Drive/Photos 的合计，可能有统计延迟和显示精度问题。Google 官方关于 Pixel 3a–5 的免配额说明限定从合格设备备份的 Storage Saver 媒体；因此 gotohp 的 Offline/Master Token 被服务器接受并且上传成功，**不等于已经证明 Google 识别它为实体 Pixel 设备或保证永久免费配额**。参见 Google Photos 官方帮助 https://support.google.com/pixelphone/answer/6220791 。
 
-**兼容与回归**：Python 模拟测试覆盖首次自动使用文件夹相册、停止/恢复设置持久化、旧路径重添加后只扫描新文件、停用来源不删除原图/SQLite、网络盘脱机与恢复、已成功且手工核验的媒体不被重新排队，以及 CSRF 拒绝未经授权操作。测试数及实际部署/CI 结果应在验收后记录；严禁仅凭源码修改宣称线上切换完成。
+**兼容与回归（2026-11-15 北京时间已验收）**：Mac M2 本地 **33 项 Python 测试全部通过**（含首次自动使用文件夹名相册、停止/重启后设置持久化、旧路径重添加后只哈希新文件、停用来源保留照片/SQLite、网络盘脱机重挂载、已 API 接收及手工云端核验的媒体不重新排队、CSRF 保护）；`node --check webui/app.js`、`git diff --check` 通过。源码提交 `a7a35292fa87954e627ed808884f28db5649452d` 已推送 `samni728/GoogleUnlimited main`，GitHub Actions [43685999288](https://github.com/samni728/GoogleUnlimited/actions/runs/43685999288) 的 Lint/macOS/Linux/Windows 全部 **success**。
+
+**Mac M2 实机安全部署验收**：检查旧 `8796` PID 和端口所有者，待当前约 124 MB 视频自然上传完成、确认无 `uploading` 后备份 `webui/state/queue.pre-auto-sync-20261115.sqlite3`（409600 bytes），停止旧服务。仅在 SQLite `settings` 中把 `auto_sync` 设置为 `1`（用户已明确要求自动上传），再用 `python3 webui/server.py --port 8796 --engine owned --allow-real-upload` 重新启动。本机 HTTP 200、首页已实际服务一个 `sync-switch`（旧 `monitor-switch` 和 `upload-switch` 已移除），API 验证 `auto_sync_enabled=true`、`auto_sync_requested=true`、`monitor_enabled=true`、`upload_enabled=true`、`owned_build_verified=true`、`credentials_present=true`。SQLite 全库仍为 586 项，来源 1 已归档的 369 项不动，来源 2 的 217 项保持进度；第一次切换后核对 11 项 API 接收、205 项 queued 和 1 项上传中、没有失败。OpenCLI Chrome Profile `8pndk8ba` 实际打开 WebUI，页面可见单一「自动同步 · 启动 / 停止」和来源进度 11/217（5%）。**部署完成且已实际继续上传，不只是通过测试。**
 
 ## 10. 之前阶段待办与交接
 
