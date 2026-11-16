@@ -6,7 +6,10 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"app/backend"
 
@@ -309,71 +312,132 @@ func shouldUseTUI(settings uploadRunSettings) bool {
 
 // teaReporter renders backend progress by forwarding it to the bubbletea program.
 type teaReporter struct {
-	p *tea.Program
+	p           *tea.Program
+	progressOut io.Writer
+	progressMu  *sync.Mutex
+}
+
+func (r teaReporter) emitProgress(event string, fields map[string]any) {
+	if r.progressOut == nil {
+		return
+	}
+	payload := map[string]any{
+		"event":     event,
+		"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	for key, value := range fields {
+		payload[key] = value
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	if r.progressMu != nil {
+		r.progressMu.Lock()
+		defer r.progressMu.Unlock()
+	}
+	_, _ = r.progressOut.Write(append(encoded, '\n'))
 }
 
 func (r teaReporter) UploadStart(start backend.UploadBatchStart) {
-	r.p.Send(uploadStartMsg{total: start.Total})
+	r.emitProgress("upload_start", map[string]any{
+		"total_files": start.Total, "total_bytes": start.TotalBytes,
+	})
+	if r.p != nil {
+		r.p.Send(uploadStartMsg{total: start.Total})
+	}
 }
 
 func (r teaReporter) UploadStop() {
-	r.p.Send(uploadCompleteMsg{})
+	r.emitProgress("upload_stop", nil)
+	if r.p != nil {
+		r.p.Send(uploadCompleteMsg{})
+	}
 }
 
 func (r teaReporter) TotalBytes(int64)      {}
 func (r teaReporter) TotalBytesDelta(int64) {}
 
 func (r teaReporter) Warning(warning backend.PreflightWarning) {
-	r.p.Send(preflightWarningMsg{
-		paths:   warning.Paths,
-		code:    warning.Code,
-		message: warning.Message,
-	})
+	if r.p != nil {
+		r.p.Send(preflightWarningMsg{
+			paths:   warning.Paths,
+			code:    warning.Code,
+			message: warning.Message,
+		})
+	}
 }
 
 func (r teaReporter) ThreadStatus(status backend.ThreadStatus) {
-	r.p.Send(fileProgressMsg{
-		workerID: status.WorkerID,
-		status:   status.Status,
-		fileName: status.FileName,
-		message:  status.Message,
+	fileName := filepath.Base(status.FileName)
+	if fileName == "." || fileName == string(filepath.Separator) {
+		fileName = filepath.Base(status.FilePath)
+	}
+	r.emitProgress("thread_status", map[string]any{
+		"worker_id":      status.WorkerID,
+		"status":         status.Status,
+		"file_name":      fileName,
+		"bytes_uploaded": status.BytesUploaded,
+		"bytes_total":    status.BytesTotal,
+		"attempt":        status.Attempt,
 	})
+	if r.p != nil {
+		r.p.Send(fileProgressMsg{
+			workerID: status.WorkerID,
+			status:   status.Status,
+			fileName: status.FileName,
+			message:  status.Message,
+		})
+	}
 }
 
 func (r teaReporter) FileResult(result backend.FileUploadResult) {
-	r.p.Send(fileCompleteMsg{
-		success:    !result.IsError && !result.Skipped,
-		skipped:    result.Skipped,
-		fileName:   result.Path,
-		paths:      result.Paths,
-		mediaKey:   result.MediaKey,
-		skipCode:   result.SkipCode,
-		skipReason: result.SkipReason,
-		err:        result.Error,
+	r.emitProgress("file_result", map[string]any{
+		"file_name": filepath.Base(result.Path),
+		"success":   !result.IsError && !result.Skipped,
+		"skipped":   result.Skipped,
 	})
+	if r.p != nil {
+		r.p.Send(fileCompleteMsg{
+			success:    !result.IsError && !result.Skipped,
+			skipped:    result.Skipped,
+			fileName:   result.Path,
+			paths:      result.Paths,
+			mediaKey:   result.MediaKey,
+			skipCode:   result.SkipCode,
+			skipReason: result.SkipReason,
+			err:        result.Error,
+		})
+	}
 }
 
 func (r teaReporter) AlbumProgress(status backend.AlbumStatus) {
-	r.p.Send(albumProgressMsg{
-		albumName:  status.AlbumName,
-		itemsAdded: status.ItemsAdded,
-		totalItems: status.TotalItems,
-	})
+	if r.p != nil {
+		r.p.Send(albumProgressMsg{
+			albumName:  status.AlbumName,
+			itemsAdded: status.ItemsAdded,
+			totalItems: status.TotalItems,
+		})
+	}
 }
 
 func (r teaReporter) AlbumComplete(status backend.AlbumStatus) {
-	r.p.Send(albumCompleteMsg{
-		albumName:  status.AlbumName,
-		itemsAdded: status.ItemsAdded,
-		albumKeys:  status.AlbumKeys,
-	})
+	if r.p != nil {
+		r.p.Send(albumCompleteMsg{
+			albumName:  status.AlbumName,
+			itemsAdded: status.ItemsAdded,
+			albumKeys:  status.AlbumKeys,
+		})
+	}
 }
 
 func (r teaReporter) AlbumError(albumErr backend.AlbumError) {
-	r.p.Send(albumErrorMsg{
-		albumName: albumErr.AlbumName,
-		error:     albumErr.Error,
-	})
+	if r.p != nil {
+		r.p.Send(albumErrorMsg{
+			albumName: albumErr.AlbumName,
+			error:     albumErr.Error,
+		})
+	}
 }
 
 func newLogger(level slog.Level) *slog.Logger {
@@ -399,7 +463,12 @@ func runUpload(paths []string, opts backend.UploadOptions, settings uploadRunSet
 	}
 	p := tea.NewProgram(model, programOptions...)
 
-	uploadManager := backend.NewUploadManager(teaReporter{p: p}, newLogger(parseLogLevel(settings.logLevel)))
+	reporter := teaReporter{p: p}
+	if settings.jsonProgress {
+		reporter.progressOut = os.Stderr
+		reporter.progressMu = &sync.Mutex{}
+	}
+	uploadManager := backend.NewUploadManager(reporter, newLogger(parseLogLevel(settings.logLevel)))
 	go uploadManager.Upload(paths, opts)
 
 	// Run until the upload manager reports UploadStop.

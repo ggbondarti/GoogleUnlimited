@@ -8,9 +8,14 @@ let selectedFile = "";
 let modalKind = "directory";
 let selectedSourceId = "";
 let showHiddenRecords = false;
+let showCompletedSources = false;
 const expandedEventSources = new Set();
 const expandedAlbumSources = new Set();
+const expandedReviewSources = new Set();
+const reviewCache = new Map();
+const scanRequestSources = new Set();
 const albumDrafts = new Map();
+let progressEndpointMissing = false;
 let pageOffset = 0;
 const pageSize = 100;
 
@@ -72,12 +77,280 @@ function collapseHiddenSourceDetails(sourceId) {
   }
   $("jobs-details").open = false;
   $("jobs-body").replaceChildren();
+  expandedReviewSources.delete(Number(sourceId));
+  reviewCache.delete(Number(sourceId));
 }
 const statusText = {
-  queued: "等待上传", uploading: "正在上传", api_accepted: "API 已接收",
+  queued: "等待上传", starting: "准备中", hashing: "计算文件信息",
+  checking: "检查云端", uploading: "正在上传", completed: "处理完成",
+  api_accepted: "API 已接收",
   duplicate: "已去重", retrying: "等待重试", failed: "上传失败",
   interrupted: "中断待人工核对", paused: "来源已暂停"
 };
+
+function formatDuration(seconds) {
+  if (seconds == null || !Number.isFinite(Number(seconds))) return "暂不可估算";
+  let value = Math.max(0, Math.round(Number(seconds)));
+  if (value < 60) return value + " 秒";
+  const minutes = Math.floor(value / 60);
+  const remainder = value % 60;
+  if (minutes < 60) return minutes + " 分" + (remainder ? remainder + " 秒" : "");
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return hours + " 小时" + (remainingMinutes ? remainingMinutes + " 分" : "");
+}
+
+function formatTimestamp(value) {
+  if (!value) return "时间未知";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? String(value).replace("T", " ") :
+    date.toLocaleString("zh-CN", {hour12: false});
+}
+
+function renderUploadProgress(progress) {
+  if (!progress || !progress.queue) return;
+  const queue = progress.queue;
+  const percent = Math.max(0, Math.min(100, Number(queue.percent) || 0));
+  $("task-percent").textContent = percent + "%";
+  $("task-bar").style.width = percent + "%";
+  $("task-progress-count").textContent =
+    (queue.done || 0) + " / " + (queue.total || 0) + " 项已完成 · " +
+    (queue.pending_review || 0) + " 项待确认";
+
+  const dataPercent = Math.max(0, Math.min(100, Number(queue.data_percent) || 0));
+  $("queue-data-percent").textContent = dataPercent + "%";
+  $("queue-data-count").textContent = humanSize(queue.data_done_bytes) + " / " +
+    humanSize(queue.data_total_bytes);
+  $("queue-data-bar").style.width = dataPercent + "%";
+
+  const last = progress.last_completed;
+  $("last-completed-name").textContent = last?.file_name || "暂无已完成文件";
+  $("last-completed-meta").textContent = last
+    ? humanSize(last.bytes) + " · " + formatTimestamp(last.completed_at) + " · API 已接收"
+    : "完成第一个文件后，这里会显示文件名、大小和完成时间";
+
+  const current = progress.current;
+  if (!current) {
+    $("upload-current-name").textContent = "当前没有文件正在处理";
+    $("upload-current-state").textContent = "等待队列任务";
+    $("upload-current-percent").textContent = "—";
+    $("upload-current-bar").style.width = "0%";
+    $("upload-current-bytes").textContent = "—";
+    $("upload-current-speed").textContent = "—";
+    $("upload-current-elapsed").textContent = "—";
+    $("upload-current-eta").textContent = "—";
+  } else {
+    $("upload-current-name").textContent = current.file_name || "文件名未知";
+    $("upload-current-state").textContent =
+      (statusText[current.status] || current.status || "处理中") +
+      (current.attempt > 1 ? " · 第 " + current.attempt + " 次尝试" : "");
+    $("upload-current-percent").textContent =
+      current.percent == null ? "准备中" : current.percent + "%";
+    $("upload-current-bar").style.width =
+      current.percent == null ? "0%" : Math.max(0, Math.min(100, current.percent)) + "%";
+    $("upload-current-bytes").textContent =
+      humanSize(current.bytes_uploaded) + " / " + humanSize(current.bytes_total);
+    $("upload-current-speed").textContent = current.speed_bps > 0
+      ? humanSize(current.speed_bps) + "/s" : "正在采集实际速度";
+    $("upload-current-elapsed").textContent = formatDuration(current.elapsed_seconds);
+    $("upload-current-eta").textContent = current.eta_seconds != null
+      ? formatDuration(current.eta_seconds)
+      : (current.status === "uploading" ? "正在采集速度" : "等待进入上传阶段");
+  }
+
+  $("upload-average-time").textContent = queue.average_file_seconds == null
+    ? "样本不足" : formatDuration(queue.average_file_seconds) +
+      " / 文件（最近 " + queue.average_sample_count + " 个）";
+  $("upload-queue-eta").textContent = queue.eta_seconds != null
+    ? formatDuration(queue.eta_seconds)
+    : (queue.uploadable_remaining === 0 ? "暂无已确认待上传任务" :
+      (queue.average_sample_count < 3 ? "至少完成 3 个文件后估算" : "当前无法估算"));
+  $("upload-pending-review").textContent =
+    (queue.pending_review || 0) + " 项等待人工确认，不计入上传队列 ETA";
+}
+
+async function refreshProgress() {
+  try {
+    const progress = await get("/api/progress");
+    renderUploadProgress(progress);
+    progressEndpointMissing = false;
+  } catch (error) {
+    if (!progressEndpointMissing) {
+      $("upload-current-state").textContent = "实时进度接口将在本地服务更新后启用";
+      progressEndpointMissing = true;
+    }
+  }
+}
+
+function renderScanPreview(source, container, jobs, total) {
+  clear(container);
+  const pending = Number(source.pending_review_count) || 0;
+  const changed = Number(source.changed_count) || 0;
+  const intro = element("div", "scan-preview-summary",
+    "待确认 " + pending + " 项 · " + humanSize(source.pending_review_bytes) +
+    (changed ? " · 内容变化 " + changed + " 项" : ""));
+  container.appendChild(intro);
+  const report = currentStatus?.last_scan_report;
+  const sourceReport = report && report.source_ids?.length === 1 &&
+    Number(report.source_ids[0]) === Number(source.id) ? report : null;
+  if (sourceReport) {
+    const stats = element("div", "scan-report-grid");
+    const values = [
+      ["新增", sourceReport.new], ["内容变化", sourceReport.changed],
+      ["已存在", sourceReport.existing], ["重复", sourceReport.duplicate],
+      ["不可用来源", sourceReport.unavailable], ["不稳定文件", sourceReport.unstable],
+      ["本地缺失", sourceReport.missing],
+    ];
+    for (const [label, value] of values) {
+      const cell = element("div", "scan-report-stat");
+      cell.append(element("small", null, label), element("strong", null, Number(value) || 0));
+      stats.appendChild(cell);
+    }
+    container.appendChild(stats);
+    if (sourceReport.error) {
+      container.appendChild(element("div", "scan-preview-note", sourceReport.error));
+    }
+  }
+  if (!source.album_confirmed) {
+    container.appendChild(element("div", "scan-preview-note",
+      "请先在“上传前设置”中保存并确认目标相册，再选择画质。扫描不会自动上传。"));
+  }
+  if (!jobs.length) {
+    container.appendChild(element("div", "empty", pending
+      ? "正在整理扫描结果，请稍后刷新。" : "没有发现新增或变化文件；原有上传记录保持不变。"));
+    return;
+  }
+
+  const selection = element("div", "scan-selection-head");
+  const selectAllLabel = element("label", "scan-select-all");
+  const selectAll = element("input");
+  selectAll.type = "checkbox";
+  selectAllLabel.append(selectAll, element("span", null, "全选当前列表"));
+  selection.appendChild(selectAllLabel);
+  const selectedSummary = element("span", "scan-selected-summary", "已选 0 项");
+  selection.appendChild(selectedSummary);
+  container.appendChild(selection);
+
+  const list = element("div", "scan-review-list");
+  const checks = [];
+  for (const job of jobs) {
+    const item = element("label", "scan-review-item");
+    const check = element("input");
+    check.type = "checkbox";
+    check.dataset.jobId = String(job.id);
+    check.dataset.bytes = String(job.bytes || 0);
+    checks.push(check);
+    const fileInfo = element("span", "scan-review-file");
+    fileInfo.appendChild(element("strong", null, job.name));
+    fileInfo.appendChild(element("small", null,
+      (job.change_kind === "changed" ? "内容已变化" : "新增文件") +
+      " · " + humanSize(job.bytes) + " · " + (job.media_kind === "video" ? "视频" : "照片")));
+    item.append(check, fileInfo);
+    list.appendChild(item);
+  }
+  container.appendChild(list);
+
+  if (total > jobs.length) {
+    container.appendChild(element("div", "scan-preview-note",
+      "当前显示前 " + jobs.length + " 项，共 " + total +
+      " 项；确认本批后可继续确认下一批，单次最多 500 项。"));
+  }
+
+  const actions = element("div", "scan-preview-actions");
+  const confirmButton = element("button", "btn primary",
+    currentStatus?.auto_sync_enabled && source.upload_ready
+      ? "确认所选并开始上传" : "确认所选并加入队列");
+  confirmButton.type = "button";
+  confirmButton.disabled = !source.album_confirmed;
+  const updateSelection = () => {
+    const selected = checks.filter(check => check.checked);
+    const bytes = selected.reduce((sum, check) => sum + Number(check.dataset.bytes || 0), 0);
+    selectedSummary.textContent = "已选 " + selected.length + " 项 · " + humanSize(bytes);
+    confirmButton.disabled = !source.album_confirmed || selected.length === 0;
+    selectAll.checked = selected.length === checks.length && checks.length > 0;
+    selectAll.indeterminate = selected.length > 0 && selected.length < checks.length;
+  };
+  selectAll.addEventListener("change", () => {
+    for (const check of checks) check.checked = selectAll.checked;
+    updateSelection();
+  });
+  for (const check of checks) check.addEventListener("change", updateSelection);
+  confirmButton.addEventListener("click", async () => {
+    const selected = checks.filter(check => check.checked).map(check => Number(check.dataset.jobId));
+    if (!selected.length) return;
+    const totalBytes = checks.filter(check => check.checked)
+      .reduce((sum, check) => sum + Number(check.dataset.bytes || 0), 0);
+    const quality = source.upload_quality === "original"
+      ? "Original quality（原始画质）" : "Storage saver（节省空间）";
+    const startNow = !!currentStatus?.auto_sync_enabled && !!source.upload_ready;
+    const message = "确认将 " + selected.length + " 个文件（" + humanSize(totalBytes) +
+      "）加入上传队列？\n目标相册：" + source.album_name +
+      "\n上传画质：" + quality +
+      (startNow ? "\n全局与来源同步均已开启，确认后将开始上传。" :
+        "\n当前同步许可未全部开启，只会加入队列，不会立即上传。");
+    if (!confirm(message)) return;
+    confirmButton.disabled = true;
+    try {
+      const result = await post("/api/source/scan/confirm", {
+        id: source.id, job_ids: selected
+      });
+      reviewCache.delete(source.id);
+      notice("已确认 " + result.confirmation.confirmed_count + " 个文件，" +
+        humanSize(result.confirmation.confirmed_bytes) +
+        (startNow ? "；已交给上传队列处理。" : "；已加入队列，等待同步开关允许。"), true);
+      await refresh();
+    } catch (error) {
+      confirmButton.disabled = false;
+      notice(error.message);
+    }
+  });
+  actions.appendChild(selectedSummary);
+  actions.appendChild(confirmButton);
+  container.appendChild(actions);
+  updateSelection();
+}
+
+async function loadScanPreview(source, container) {
+  if (source.scanning) {
+    container.replaceChildren(element("div", "scan-preview-note",
+      "正在扫描本地目录；扫描只建立索引，不会开始上传。"));
+    return;
+  }
+  const cached = reviewCache.get(source.id);
+  if (cached) {
+    renderScanPreview(source, container, cached.jobs, cached.total);
+    return;
+  }
+  if (container.dataset.loading === "1") return;
+  container.dataset.loading = "1";
+  container.replaceChildren(element("div", "empty", "读取待确认文件清单…"));
+  try {
+    const result = await get("/api/jobs?source_id=" + encodeURIComponent(source.id) +
+      "&status=pending_review&limit=500");
+    reviewCache.set(source.id, {jobs: result.jobs, total: result.total});
+    renderScanPreview(source, container, result.jobs, result.total);
+  } catch (error) {
+    container.replaceChildren(element("div", "empty", error.message));
+  } finally {
+    container.dataset.loading = "0";
+  }
+}
+
+async function requestSourceScan(sourceId) {
+  if (scanRequestSources.has(sourceId)) return;
+  scanRequestSources.add(sourceId);
+  expandedReviewSources.add(sourceId);
+  reviewCache.delete(sourceId);
+  try {
+    await post("/api/source/scan", {id: sourceId});
+    notice("已开始增量扫描。扫描只检查新增和变化文件，不会自动上传。", true);
+    await refresh();
+  } catch (error) {
+    notice(error.message);
+  } finally {
+    scanRequestSources.delete(sourceId);
+  }
+}
 
 function renderCounts(counts) {
   const sum = key => counts[key]?.count || 0;
@@ -92,14 +365,32 @@ function renderCounts(counts) {
   $("task-bar").style.width = pct + "%";
 }
 
+// These files have been accepted by the upload API, NOT independently
+// verified on the Google Photos website. Keep their source active so a future
+// scan can discover and upload newly added files.
+function isApiProcessedSource(source) {
+  const total = Number(source.indexed_files) || 0;
+  return source.ui_visibility === "visible" && !source.archived && total > 0 &&
+    (Number(source.api_accepted) || 0) === total && !source.uploading;
+}
+
 function renderSources(sources) {
   const target = $("sources-list");
   clear(target);
-  if (!sources.length) {
-    target.appendChild(element("div", "empty", "还没有添加文件夹。添加后自动扫描；同步运行时直接上传，历史永久保留。"));
+  const processedCount = sources.filter(isApiProcessedSource).length;
+  const processedToggle = $("show-completed-btn");
+  processedToggle.hidden = processedCount === 0;
+  processedToggle.textContent = (showCompletedSources ? "收起已处理" : "查看已处理") +
+    "（" + processedCount + "）";
+  processedToggle.setAttribute("aria-pressed", showCompletedSources ? "true" : "false");
+  const visibleSources = showCompletedSources ? sources : sources.filter(s => !isApiProcessedSource(s));
+  if (!visibleSources.length) {
+    target.appendChild(element("div", "empty", processedCount
+      ? "当前没有需要处理的来源。" + processedCount + " 个来源的现有文件已被 API 接收，点击“查看已处理”可查看。"
+      : "还没有添加文件夹。添加后先扫描并确认相册，只有明确允许的来源才会上传。"));
     return;
   }
-  for (const source of sources) {
+  for (const source of visibleSources) {
     const row = element("div", "source-entry" + (source.archived ? " archived" : ""));
     row.appendChild(element("span", "source-ic", source.kind === "directory" ? "▣" : "▤"));
     const info = element("div", "source-meta");
@@ -114,10 +405,12 @@ function renderSources(sources) {
     else if (source.availability === "interrupted") badges.push("扫描中断");
     else if (source.availability === "unknown") badges.push("等待重新扫描");
     else if (!source.enabled) badges.push("已暂停");
-    if (source.enabled && !source.archived)
+    if (isApiProcessedSource(source)) badges.push("现有文件已处理 · 新文件仍会继续检查");
+    else if (!source.album_confirmed && !source.archived) badges.push("请先确认相册，才能允许上传");
+    else if (source.enabled && !source.archived)
       badges.push(source.upload_ready
-        ? (currentStatus?.upload_enabled ? "已允许上传" : "上传许可已保存 · 全局暂停")
-        : "待确认上传 · 仅扫描");
+        ? (currentStatus?.upload_enabled ? "参与自动同步 · 全局运行中" : "已允许上传 · 全局暂停")
+        : "未加入自动同步 · 仅建立索引");
     if (source.api_accepted > 0 && !source.album_key)
       badges.push("相册 ID 未绑定 · 暂停后续上传");
     else if (source.album_key)
@@ -128,10 +421,12 @@ function renderSources(sources) {
     info.appendChild(element("small", "source-badges", badges.join(" · ")));
     const uploaded = source.api_accepted || 0;
     const all = source.indexed_files || 0;
-    const pct = all ? Math.round(uploaded * 100 / all) : 0;
-    info.appendChild(element("small", "source-badges",
-      "已发现 " + all + " 项（照片 " + source.images + " / 视频 " + source.videos +
-      "） · 已接收 " + uploaded + " / " + all + " · " + pct + "% · 云端核验 " + source.cloud_verified));
+    info.appendChild(element("small", "source-badges", all
+      ? "已发现 " + all + " 项（照片 " + source.images + " / 视频 " + source.videos +
+        "） · API 已接收 " + uploaded + "/" + all +
+        " · 待处理 " + Math.max(0, all - uploaded) +
+        (source.cloud_verified ? " · 已人工核验 " + source.cloud_verified : "")
+      : "尚未发现媒体（可能正在扫描，也可能是空目录）"));
     info.appendChild(element("small", "source-badges",
       "画质：" + (source.upload_quality === "original" ? "Original quality（原画质）" :
         "Storage saver（节省空间）")));
@@ -154,12 +449,27 @@ function renderSources(sources) {
       $("index").scrollIntoView({behavior: "smooth", block: "start"});
     });
     controls.appendChild(index);
+    if (source.ui_visibility === "visible" && !source.archived) {
+      const scan = element("button", "btn soft",
+        source.scanning || scanRequestSources.has(source.id) ? "扫描中…" : "增量扫描");
+      scan.type = "button";
+      scan.disabled = !!source.scanning || scanRequestSources.has(source.id) ||
+        source.availability === "offline";
+      scan.title = source.availability === "offline"
+        ? "请先重新挂载本地磁盘或网络共享"
+        : "手动检查这个来源的新增和变化文件；扫描不会上传";
+      scan.addEventListener("click", () => requestSourceScan(source.id));
+      controls.appendChild(scan);
+    }
     if (source.ui_visibility === "removed") {
       const restore = element("button", "btn primary", "重新启用");
       restore.title = "已挂载时单击恢复，接着上传未完成文件；不重传已接收的内容";
-      restore.addEventListener("click", () =>
+      restore.addEventListener("click", () => {
+        expandedReviewSources.add(source.id);
+        reviewCache.delete(source.id);
         action("/api/source/restore", {id: source.id},
-          "映射已恢复，保留原进度；自动同步运行时继续上传"));
+          "映射已恢复并扫描一次；保留原进度，新文件等待你确认后才上传");
+      });
       controls.appendChild(restore);
     } else if (source.ui_visibility === "hidden") {
       const show = element("button", "btn soft", "显示");
@@ -169,43 +479,62 @@ function renderSources(sources) {
       controls.appendChild(show);
     } else if (source.archived) {
       const restore = element("button", "btn primary", "恢复历史");
-      restore.addEventListener("click", () =>
+      restore.addEventListener("click", () => {
+        expandedReviewSources.add(source.id);
+        reviewCache.delete(source.id);
         action("/api/source/restore", {id: source.id},
-          "历史来源已恢复。旧文件备份记录仍然保留，不会重新登记已接受的内容。"));
+          "历史来源已恢复并扫描一次；旧文件记录保留，新文件等待确认。");
+      });
       controls.appendChild(restore);
     } else {
-      const checkbox = element("input");
-      checkbox.type = "checkbox";
-      checkbox.checked = !!source.enabled;
-      checkbox.title = source.enabled ? "暂停来源" : "恢复来源";
-      checkbox.addEventListener("change", () =>
-        action("/api/source/toggle", {id: source.id, enabled: checkbox.checked},
-          checkbox.checked ? "来源已恢复" : "来源已暂停，索引和记录保留"));
-      const toggle = element("label", "switch");
-      toggle.append(checkbox, element("span"));
-      controls.appendChild(toggle);
-      const uploadButton = element("button", source.upload_ready ? "btn warn" : "btn primary",
-        source.upload_ready ? "■ 暂停此来源上传" : "允许此来源上传");
-      uploadButton.type = "button";
-      uploadButton.disabled = !source.enabled || (!source.upload_ready && !source.album_confirmed);
-      uploadButton.title = source.upload_ready
-        ? "停止后续文件进入上传；已经启动的单个文件可完成"
-        : (!source.album_confirmed ? "先展开相册设置，保存并确认相册名称" :
-          "确认后才允许此来源的未上传文件加入自动队列");
-      uploadButton.addEventListener("click", async () => {
-        const enabled = !source.upload_ready;
-        if (enabled && !confirm("确认允许此来源上传？\n相册：" + source.album_name +
-          "\n画质：" + (source.upload_quality === "original" ? "Original quality" : "Storage saver") +
-          "\n未上传文件将在全局同步开关启动后自动上传。建议先暂停全局同步进行单张试传。")) return;
-        await action("/api/source/upload", {id: source.id, enabled},
-          enabled
-            ? (currentStatus?.auto_sync_enabled
-              ? "此来源已允许上传，队列将开始处理。" : "此来源已准备好；全局同步仍暂停，你可以先试传或再手动开启。")
-            : "已暂停此来源后续上传，原文件与队列记录不变。");
-      });
-      controls.appendChild(uploadButton);
+      if (!source.enabled) {
+        const resume = element("button", "btn soft", "恢复此来源");
+        resume.title = "恢复目录扫描，但不会擅自开启上传许可";
+        resume.addEventListener("click", () => action("/api/source/toggle",
+          {id: source.id, enabled: true}, "来源扫描已恢复。需要上传时再开启来源同步。"));
+        controls.appendChild(resume);
+      } else if (!source.album_confirmed) {
+        const setup = element("button", "btn primary", "先确认相册");
+        setup.title = "当前来源相册未确认，所以不能开启同步；点击展开相册设置";
+        setup.addEventListener("click", () => {
+          album.open = true;
+          expandedAlbumSources.add(source.id);
+          album.scrollIntoView({behavior: "smooth", block: "center"});
+        });
+        controls.appendChild(setup);
+      } else {
+        // Only ONE per-source sync control. The old unlabeled green switch
+        // controlled scanning, not upload, which was confusing next to the
+        // separate "允许上传" button. Keep that scanning API for compatibility.
+        const syncControl = element("label", "source-sync-control");
+        syncControl.appendChild(element("span", "source-sync-label", "此来源同步"));
+        const syncSwitch = element("span", "switch");
+        const permission = element("input");
+        permission.type = "checkbox";
+        permission.checked = !!source.upload_ready;
+        permission.title = source.upload_ready ? "关闭此来源的后续上传" : "允许此来源参与全局同步";
+        permission.addEventListener("change", async () => {
+          const enabled = permission.checked;
+          if (enabled && !confirm("允许此来源参与自动同步？\n相册：" + source.album_name +
+            "\n画质：" + (source.upload_quality === "original" ? "Original quality" : "Storage saver") +
+            "\n只有顶部总开关开启时才会上传未完成文件。")) {
+            permission.checked = false;
+            return;
+          }
+          await action("/api/source/upload", {id: source.id, enabled},
+            enabled ? (currentStatus?.auto_sync_enabled ? "此来源已加入同步。" : "来源许可已保存；顶部同步当前暂停。") :
+              "此来源已暂停后续上传，原文件与历史保留。");
+        });
+        syncSwitch.append(permission, element("span"));
+        syncControl.append(syncSwitch, element("span", "source-sync-state",
+          source.upload_ready ? "已允许" : "已暂停"));
+        controls.appendChild(syncControl);
+      }
     }
     if (source.ui_visibility === "visible") {
+      const more = element("details", "source-more-actions");
+      more.appendChild(element("summary", null, "更多"));
+      const morePanel = element("div", "source-more-panel");
       const hide = element("button", "btn soft", "隐藏");
       hide.title = "只整理界面，不暂停同步、不更改媒体历史";
       hide.addEventListener("click", () => {
@@ -213,7 +542,7 @@ function renderSources(sources) {
         action("/api/source/display", {id: source.id, mode: "hidden"},
           "索引已隐藏，数据库和备份历史完整保留");
       });
-      controls.appendChild(hide);
+      morePanel.appendChild(hide);
       const remove = element("button", "btn warn", "删除显示");
       remove.title = "停止此来源并移除映射；保留照片、SQLite 和已上传历史";
       remove.addEventListener("click", () => {
@@ -223,7 +552,9 @@ function renderSources(sources) {
             "已停止该来源并保存全部进度，重新添加相同目录即可继续");
         }
       });
-      controls.appendChild(remove);
+      morePanel.appendChild(remove);
+      more.appendChild(morePanel);
+      controls.appendChild(more);
     }
     row.appendChild(controls);
     const events = element("details", "source-event-details");
@@ -370,7 +701,7 @@ function renderSources(sources) {
     });
     albumBody.appendChild(test);
     albumBody.appendChild(element("small", "source-album-hint",
-      "新来源默认不会上传。先保存相册、选择画质；全局暂停时可单张测试，完成确认后再允许此来源上传。"));
+      "新来源默认不会上传。先确认相册与画质；全局暂停时可单张测试，确认后打开“此来源同步”即可。"));
     album.appendChild(albumBody);
     album.addEventListener("toggle", () => {
       if (album.open) expandedAlbumSources.add(source.id);
@@ -378,6 +709,30 @@ function renderSources(sources) {
     });
     if (expandedAlbumSources.has(source.id)) album.open = true;
     row.appendChild(album);
+
+    if (source.ui_visibility === "visible" && !source.archived &&
+        (source.pending_review_count > 0 || source.scanning || expandedReviewSources.has(source.id))) {
+      const review = element("details", "source-review-details");
+      const reviewTitle = source.scanning ? "正在扫描…" :
+        "待确认 " + (source.pending_review_count || 0) + " 项 · " +
+        humanSize(source.pending_review_bytes || 0);
+      review.appendChild(element("summary", null, reviewTitle));
+      const reviewBody = element("div", "source-review-body");
+      review.appendChild(reviewBody);
+      review.addEventListener("toggle", () => {
+        if (review.open) {
+          expandedReviewSources.add(source.id);
+          loadScanPreview(source, reviewBody);
+        } else {
+          expandedReviewSources.delete(source.id);
+        }
+      });
+      if (expandedReviewSources.has(source.id)) {
+        review.open = true;
+        loadScanPreview(source, reviewBody);
+      }
+      row.appendChild(review);
+    }
     target.appendChild(row);
   }
 }
@@ -583,6 +938,7 @@ async function refresh() {
     csrf = status.csrf;
     currentStatus = status;
     renderCounts(status.counts);
+    if (status.upload_progress) renderUploadProgress(status.upload_progress);
     renderSources(status.sources);
     renderJobFilters(status.sources);
     $("show-hidden-btn").textContent = (showHiddenRecords ? "隐藏历史记录" : "显示隐藏记录")
@@ -609,12 +965,11 @@ async function refresh() {
       ? (status.owned_build_verified ? "自行编译 · SHA 校验通过" : "自行编译 · 尚未通过构建验证")
       : "第三方发行版 · 固定 SHA-256";
     $("upload-reason").textContent = status.auto_sync_enabled
-      ? "全局运行中：只上传单独点击“允许此来源上传”的目录。添加新目录仍只扫描。"
+      ? "正在运行：只处理下方“此来源同步”已允许的目录。新添加的目录仍需确认相册。"
       : (status.allow_real_upload && status.credentials_present
-        ? "已停止，记录保留。可以调整相册名称和画质、进行单张试传；只有已获上传许可的目录会在启动后继续。"
+        ? "已暂停：不会开始新文件；已接收和待上传记录全部保留。"
         : "尚未完成本机账号授权或上传引擎未就绪。");
-    $("scan-label").textContent = status.scan_running
-      ? "正在检查新文件" : (status.auto_sync_enabled ? "自动同步中" : "已停止");
+    $("scan-label").textContent = status.scan_running ? "正在扫描" : "手动扫描模式";
     $("last-scan").textContent = status.last_scan
       ? "最近扫描：" + status.last_scan + (status.last_scan_error ? " · " + status.last_scan_error : "")
       : "尚未扫描";
@@ -720,9 +1075,14 @@ async function addSource() {
   const type = document.querySelector('input[name="kind"]:checked').value;
   const path = $("browser-path").value.trim();
   try {
-    await post("/api/sources", {kind: type, path});
+    const result = await post("/api/sources", {kind: type, path});
+    const added = result.sources?.find(source => source.path === path) || result.sources?.[0];
+    if (added) {
+      expandedReviewSources.add(added.id);
+      reviewCache.delete(added.id);
+    }
     $("source-dialog").close();
-    notice("已添加 / 恢复来源：仅建立 SQLite 索引，不自动上传。请先确认相册名称与画质，测试后点击“允许此来源上传”。", true);
+    notice("已添加来源并开始首次扫描；扫描不会自动上传。请先检查文件、相册和画质，再确认上传。", true);
     await refresh();
   } catch (error) {
     $("browser-items").replaceChildren(element("div", "empty", error.message));
@@ -739,6 +1099,10 @@ document.addEventListener("DOMContentLoaded", () => {
       selectedSourceId = "";
       $("index-summary").textContent = "目录明细已收起。选择来源并点击“查看索引”可展开。";
     }
+    refresh();
+  });
+  $("show-completed-btn").addEventListener("click", () => {
+    showCompletedSources = !showCompletedSources;
     refresh();
   });
   $("index-details").addEventListener("toggle", () => {
@@ -760,7 +1124,10 @@ document.addEventListener("DOMContentLoaded", () => {
   $("storage-network").addEventListener("click", () => selectStorage("network"));
   $("refresh-volumes").addEventListener("click", refreshVolumes);
   $("connect-share-btn").addEventListener("click", connectShare);
-  $("scan-btn").addEventListener("click", () => action("/api/scan", {}, "已请求重新扫描"));
+  $("scan-btn").addEventListener("click", () => {
+    reviewCache.clear();
+    action("/api/scan", {}, "已请求扫描所有来源；扫描只建立索引，不会自动上传。");
+  });
   $("refresh-btn").addEventListener("click", refresh);
   $("page-prev").addEventListener("click", () => {
     pageOffset = Math.max(0, pageOffset - pageSize);
@@ -775,7 +1142,7 @@ document.addEventListener("DOMContentLoaded", () => {
   }
   $("sync-switch").addEventListener("change", e => {
     if (e.target.checked && !confirm(
-      "启动全局自动同步？只有逐个点击过“允许此来源上传”的目录才会继续传输；新添加的目录不会自动上传。")) {
+      "开启全部自动同步？只有下方“此来源同步”设为已允许的目录才会上传；新目录默认不上传。")) {
       e.target.checked = false;
       return;
     }
@@ -795,5 +1162,7 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
   refresh();
+  refreshProgress();
   setInterval(refresh, 4000);
+  setInterval(refreshProgress, 1000);
 });

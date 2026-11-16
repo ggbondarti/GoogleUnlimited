@@ -1,5 +1,6 @@
 """No-Google-credentials tests for independent local WebUI."""
 import http.client
+import io
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,20 @@ import unittest
 from unittest import mock
 
 from webui.server import Store, UserError, make_handler, ThreadingHTTPServer
+
+
+class FakeUploadProcess:
+    """Small Popen stand-in with separate stdout summary and stderr JSONL."""
+    def __init__(self, stdout="", stderr="", returncode=0):
+        self.stdout = io.StringIO(stdout)
+        self.stderr = io.StringIO(stderr)
+        self.returncode = returncode
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def kill(self):
+        self.returncode = -9
 
 
 class WebUITest(unittest.TestCase):
@@ -36,10 +51,18 @@ class WebUITest(unittest.TestCase):
 
     def wait_for_jobs(self, count):
         for _ in range(150):
-            if len(self.store.jobs()) >= count:
+            if (len(self.store.jobs()) >= count and
+                    not self.store.scan_thread_running and not self.store.scan_running):
                 return
             time.sleep(0.02)
         self.fail("asynchronous scan did not create expected jobs")
+
+    def confirm_pending(self, source_id):
+        pending = [job["id"] for job in self.store.jobs(source_id=source_id)
+                   if job["status"] == "pending_review"]
+        if pending:
+            return self.store.confirm_scan(source_id, pending)
+        return {"confirmed_count": 0, "confirmed_bytes": 0, "job_ids": []}
 
     def test_defaults_are_safe(self):
         state = self.store.status()
@@ -60,7 +83,13 @@ class WebUITest(unittest.TestCase):
         self.assertIn('const controls = element("div", "source-controls")', js)
         self.assertIn("row.appendChild(controls)", js)
         self.assertIn("controls.appendChild(index)", js)
-        self.assertIn("controls.appendChild(remove)", js)
+        self.assertIn("morePanel.appendChild(remove)", js)
+        self.assertIn('const syncControl = element("label", "source-sync-control")', js)
+        self.assertIn('const permission = element("input")', js)
+        self.assertIn('permission.checked = !!source.upload_ready', js)
+        self.assertNotIn('checkbox.checked = !!source.enabled', js)
+        self.assertIn('"show-completed-btn"', js)
+        self.assertIn('"先确认相册"', js)
         self.assertIn("grid-template-columns: 42px minmax(0, 1fr) auto", css)
         self.assertIn(".source-album-form", css)
         self.assertIn("source-album-settings", js)
@@ -76,6 +105,62 @@ class WebUITest(unittest.TestCase):
         self.assertIn("@media (max-width: 1110px)", css)
         self.assertIn("grid-template-columns:repeat(2,minmax(0,1fr))", css)
         self.assertIn("engine-state", (base / "index.html").read_text(encoding="utf-8"))
+
+    def test_live_upload_progress_panel_is_collapsed_and_uses_real_api_events(self):
+        base = Path(__file__).resolve().parents[1] / "webui"
+        js = (base / "app.js").read_text(encoding="utf-8")
+        html = (base / "index.html").read_text(encoding="utf-8")
+        self.assertIn('id="upload-progress-details"', html)
+        self.assertIn('id="last-completed-name"', html)
+        self.assertIn('id="last-completed-meta"', html)
+        self.assertIn('id="upload-current-name"', html)
+        self.assertIn('id="upload-current-speed"', html)
+        self.assertIn('id="upload-current-eta"', html)
+        self.assertIn('id="upload-queue-eta"', html)
+        self.assertIn("function renderUploadProgress(progress)", js)
+        self.assertIn('get("/api/progress")', js)
+        self.assertIn("setInterval(refreshProgress, 1000)", js)
+        self.assertIn("average_sample_count", js)
+
+    def test_manual_incremental_scan_ui_requires_explicit_file_confirmation(self):
+        base = Path(__file__).resolve().parents[1] / "webui"
+        js = (base / "app.js").read_text(encoding="utf-8")
+        html = (base / "index.html").read_text(encoding="utf-8")
+        self.assertIn("增量扫描", js)
+        self.assertIn("/api/source/scan", js)
+        self.assertIn("/api/source/scan/confirm", js)
+        self.assertIn("pending_review_count", js)
+        self.assertIn("确认所选并开始上传", js)
+        self.assertIn('id="scan-btn"', html)
+
+    def test_completed_source_auto_collapse_is_only_a_view_filter(self):
+        """A 217/217 source is folded, while pending/empty/hidden ones aren't misclassified."""
+        base = Path(__file__).resolve().parents[1] / "webui"
+        js = (base / "app.js").read_text(encoding="utf-8")
+        html = (base / "index.html").read_text(encoding="utf-8")
+        self.assertIn('id="show-completed-btn"', html)
+        self.assertIn('const visibleSources = showCompletedSources ?', js)
+        self.assertIn('showCompletedSources = !showCompletedSources', js)
+        if not shutil.which("node"):
+            return
+        script = r'''
+const fs=require('fs'),assert=require('assert');
+const js=fs.readFileSync(process.argv[1],'utf8');
+const a=js.indexOf('function isApiProcessedSource(');
+const b=js.indexOf('\nfunction renderSources(',a);
+assert(a>=0 && b>a);
+const classify=new Function(js.slice(a,b)+'\nreturn isApiProcessedSource;')();
+const base={ui_visibility:'visible',archived:0,indexed_files:217,api_accepted:217,uploading:0};
+assert.strictEqual(classify(base),true);
+assert.strictEqual(classify({...base,api_accepted:216}),false);
+assert.strictEqual(classify({...base,indexed_files:0,api_accepted:0}),false);
+assert.strictEqual(classify({...base,ui_visibility:'hidden'}),false);
+assert.strictEqual(classify({...base,archived:1}),false);
+assert.strictEqual(classify({...base,uploading:1}),false);
+'''
+        result = subprocess.run(["node", "-e", script, str(base / "app.js")],
+                                capture_output=True, text=True, timeout=60, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_folder_progress_is_compact_and_uses_api_accepted_not_cloud_verified(self):
         base = Path(__file__).resolve().parents[1] / "webui"
@@ -117,7 +202,7 @@ assert.deepStrictEqual(calc(999, 2), {
 });
 """
         result = subprocess.run(["node", "-e", script, str(base / "app.js")],
-                                capture_output=True, text=True, timeout=15, check=False)
+                                capture_output=True, text=True, timeout=60, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_album_requires_explicit_confirmation_before_bulk_upload(self):
@@ -139,6 +224,8 @@ assert.deepStrictEqual(calc(999, 2), {
                          "示例旅行相册")
         self.assertIsNone(self.store._next_job())
         self.store.set_source_upload(source["id"], True)
+        self.assertIsNone(self.store._next_job())
+        self.confirm_pending(source["id"])
         self.assertIsNotNone(self.store._next_job())
         self.assertTrue(any(event["action"] == "album_confirmed"
                             for event in self.store.source_events(source["id"])))
@@ -163,6 +250,8 @@ assert.deepStrictEqual(calc(999, 2), {
         self.store.set_upload_quality(source_id, "original")
         self.assertIsNone(self.store._next_job())
         self.store.set_source_upload(source_id, True)
+        self.assertIsNone(self.store._next_job())
+        self.confirm_pending(source_id)
         self.assertIsNotNone(self.store._next_job())
         self.store.set_source_upload(source_id, False)
         self.assertIsNone(self.store._next_job())
@@ -183,6 +272,7 @@ assert.deepStrictEqual(calc(999, 2), {
         self.wait_for_jobs(2)
         source_id = self.store.sources()[0]["id"]
         self.store.set_album(source_id, "手工确认的相册")
+        self.confirm_pending(source_id)
         self.store.set_source_upload(source_id, True)
         self.store.add_source(str(self.source), "directory")
         self.assertEqual(self.store.sources()[0]["upload_ready"], 0)
@@ -247,6 +337,8 @@ assert.deepStrictEqual(calc(999, 2), {
         self.wait_for_jobs(2)
         self.store.scan()
         source_id = self.store.sources()[0]["id"]
+        self.store.set_album(source_id, "source")
+        self.confirm_pending(source_id)
         accepted_id = next(j["id"] for j in self.store.jobs()
                            if j["path"] == str(self.media1))
         with self.store.connection() as con:
@@ -271,9 +363,9 @@ assert.deepStrictEqual(calc(999, 2), {
         self.assertEqual(jobs[str(self.media1)]["status"], "api_accepted")
         self.assertTrue(jobs[str(self.media1)]["cloud_verified_at"])
         self.assertEqual(jobs[str(self.media2)]["status"], "queued")
-        self.assertEqual(jobs[str(new_file)]["status"], "queued")
+        self.assertEqual(jobs[str(new_file)]["status"], "pending_review")
         self.assertEqual(self.store.sources()[0]["id"], source_id)
-        self.assertEqual(self.store.sources()[0]["album_confirmed"], 0)
+        self.assertEqual(self.store.sources()[0]["album_confirmed"], 1)
         self.assertEqual(self.store.sources()[0]["upload_ready"], 0)
 
     def test_upload_quality_flag_and_history_are_isolated_per_source(self):
@@ -284,9 +376,8 @@ assert.deepStrictEqual(calc(999, 2), {
         self.store.set_album(source_id, source["album_name"])
         self.assertEqual(source["upload_quality"], "original")
         job = self.store.jobs()[0]
-        with mock.patch("webui.server.subprocess.run",
-                        return_value=mock.Mock(returncode=0,
-                                               stdout='{"mediaKey":"TEST"}')) as run:
+        with mock.patch("webui.server.subprocess.Popen",
+                        return_value=FakeUploadProcess(stdout='{"mediaKey":"TEST"}')) as run:
             ok, _, _, _ = self.store._run_upload(job)
         self.assertTrue(ok)
         self.assertNotIn("--saver", run.call_args.args[0])
@@ -294,9 +385,8 @@ assert.deepStrictEqual(calc(999, 2), {
         with self.assertRaises(UserError):
             self.store.set_upload_quality(source_id, "invalid")
         self.store.set_upload_quality(source_id, "storage_saver")
-        with mock.patch("webui.server.subprocess.run",
-                        return_value=mock.Mock(returncode=0,
-                                               stdout='{"mediaKey":"TEST"}')) as run:
+        with mock.patch("webui.server.subprocess.Popen",
+                        return_value=FakeUploadProcess(stdout='{"mediaKey":"TEST"}')) as run:
             ok, _, _, _ = self.store._run_upload(job)
         self.assertTrue(ok)
         self.assertIn("--saver", run.call_args.args[0])
@@ -323,15 +413,15 @@ assert.deepStrictEqual(calc(999, 2), {
         source_id = self.store.sources()[0]["id"]
         self.store.set_album(source_id, "旅程测试相册")
         job = self.store.jobs()[0]
-        with mock.patch("webui.server.subprocess.run",
-                        return_value=mock.Mock(returncode=0,
-                                               stdout='{"mediaKey":"MOCK_MEDIA_KEY"}')) as cmd:
+        with mock.patch("webui.server.subprocess.Popen",
+                        return_value=FakeUploadProcess(stdout='{"mediaKey":"MOCK_MEDIA_KEY"}')) as cmd:
             ok, key, error, album_key = self.store._run_upload(job)
         self.assertTrue(ok)
         self.assertEqual(key, "MOCK_MEDIA_KEY")
         args = cmd.call_args.args[0]
         self.assertNotIn("--saver", args)
         self.assertEqual(args[args.index("--album") + 1], "旅程测试相册")
+        self.assertIn("--json-progress", args)
         self.assertNotIn("--delete", args)
         self.assertNotIn("--force", args)
         # Simulate an explicit one-photo request without using a Google account.
@@ -349,6 +439,34 @@ assert.deepStrictEqual(calc(999, 2), {
         self.assertEqual(result["album"], "旅程测试相册")
         self.store._run_upload.assert_called_once()
         self.assertFalse(self.store.upload_enabled)  # Never opens the batch gate.
+
+    def test_upload_cli_json_progress_is_forwarded_without_paths_or_tokens(self):
+        self.store.add_source(str(self.media1), "file")
+        self.wait_for_jobs(1)
+        source_id = self.store.sources()[0]["id"]
+        self.store.set_album(source_id, "测试相册")
+        job = self.store.jobs()[0]
+        event = json.dumps({
+            "event": "thread_status", "status": "uploading",
+            "file_name": "photo A.jpg", "bytes_uploaded": 4096,
+            "bytes_total": 15000, "attempt": 1,
+        })
+        self.store.cli = self.base / "fake_cli"
+        self.store.cli.write_bytes(b"FAKE_CLI")
+        self.store.credentials.write_text("NOT_A_REAL_TOKEN")
+        self.store.credentials.chmod(0o600)
+        with mock.patch("webui.server.subprocess.Popen",
+                        return_value=FakeUploadProcess(
+                            stdout='{"mediaKey":"MOCK_MEDIA"}',
+                            stderr=event + "\n")) as popen, mock.patch.object(
+                            self.store, "_consume_cli_progress") as consume:
+            ok, key, _, _ = self.store._run_upload(job)
+        self.assertTrue(ok)
+        self.assertEqual(key, "MOCK_MEDIA")
+        args = popen.call_args.args[0]
+        self.assertIn("--json-progress", args)
+        self.assertIn("--no-tui", args)
+        consume.assert_called_once_with(job["id"], event)
 
     def test_single_image_falls_back_to_other_unuploaded_source_without_bulk(self):
         # Click an already completed source set to Original quality. The only
@@ -370,6 +488,7 @@ assert.deepStrictEqual(calc(999, 2), {
             if any(x["path"] == str(photo) for x in self.store.jobs()):
                 break
             time.sleep(.02)
+        self.wait_for_jobs(3)  # Wait for the second source scan to mark it online.
         second = next(s for s in self.store.sources() if s["path"] == str(other))["id"]
         self.store.set_album(second, "另一个相册")
         self.store.set_upload_quality(second, "storage_saver")  # Explicitly preserve separate source preference.
@@ -408,6 +527,7 @@ assert.deepStrictEqual(calc(999, 2), {
         self.store.add_source(str(self.source), "directory")
         self.wait_for_jobs(2)
         self.store.set_album(self.store.sources()[0]["id"], "source")
+        self.confirm_pending(self.store.sources()[0]["id"])
         album_key = "AF1Qip" + "K" * 36
         self.store.allow_upload = True
         self.store.cli = self.base / "fake_cli"
@@ -415,17 +535,17 @@ assert.deepStrictEqual(calc(999, 2), {
         self.store.credentials.write_text("NOT_A_REAL_TOKEN")
         self.store.credentials.chmod(0o600)
         responses = [
-            mock.Mock(returncode=0, stdout=json.dumps({
+            FakeUploadProcess(stdout=json.dumps({
                 "results": [{"mediaKey": "MOCK_FIRST"}],
                 "album": {"albumKeys": [album_key]}
             })),
-            mock.Mock(returncode=0, stdout=json.dumps({
+            FakeUploadProcess(stdout=json.dumps({
                 "results": [{"mediaKey": "MOCK_SECOND"}],
                 "album": {"albumKeys": [album_key]}
             })),
         ]
         with mock.patch.object(self.store, "_ensure_upload_ready"), mock.patch(
-                "webui.server.subprocess.run", side_effect=responses) as runner:
+                "webui.server.subprocess.Popen", side_effect=responses) as runner:
             self.assertTrue(self.store.run_one(manual=True))
             self.assertEqual(self.store.sources()[0]["album_key"], album_key)
             self.assertTrue(self.store.run_one(manual=True))
@@ -453,6 +573,7 @@ assert.deepStrictEqual(calc(999, 2), {
         self.store.bind_album(source_id, "https://photos.google.com/album/" + key)
         self.assertEqual(self.store.sources()[0]["album_key"], key)
         self.store.set_source_upload(source_id, True)
+        self.confirm_pending(source_id)
         self.assertIsNotNone(self.store._next_job())
         with self.assertRaises(UserError):
             self.store.set_album(source_id, "different album")
@@ -466,15 +587,15 @@ assert.deepStrictEqual(calc(999, 2), {
         self.store.add_source(str(self.source), "directory")
         self.wait_for_jobs(2)
         self.store.set_album(self.store.sources()[0]["id"], "source")
+        self.confirm_pending(self.store.sources()[0]["id"])
         self.store.allow_upload = True
         self.store.cli = self.base / "fake_cli"
         self.store.cli.write_bytes(b"FAKE")
         self.store.credentials.write_text("NOT_A_REAL_TOKEN")
         self.store.credentials.chmod(0o600)
         with mock.patch.object(self.store, "_ensure_upload_ready"), mock.patch(
-                "webui.server.subprocess.run",
-                return_value=mock.Mock(returncode=0,
-                                       stdout='{"mediaKey":"MOCK_ACCEPTED"}')):
+                "webui.server.subprocess.Popen",
+                return_value=FakeUploadProcess(stdout='{"mediaKey":"MOCK_ACCEPTED"}')):
             self.assertTrue(self.store.run_one(manual=True))
         self.assertEqual(self.store.sources()[0]["album_key"], "")
         self.assertIsNone(self.store._next_job())
@@ -521,8 +642,12 @@ assert.deepStrictEqual(calc(999, 2), {
     def test_add_folder_and_detect_dedup(self):
         self.store.add_source(str(self.source), "directory")
         self.wait_for_jobs(2)
+        self.store.set_album(self.store.sources()[0]["id"], "source")
         tasks = self.store.jobs()
         self.assertEqual(len(tasks), 2)
+        self.assertEqual({x["status"] for x in tasks}, {"pending_review"})
+        self.confirm_pending(self.store.sources()[0]["id"])
+        tasks = self.store.jobs()
         self.assertEqual({x["status"] for x in tasks}, {"queued"})
         self.store.scan()
         self.assertEqual(len(self.store.jobs()), 2)
@@ -547,6 +672,7 @@ assert.deepStrictEqual(calc(999, 2), {
         self.store.add_source(str(self.source), "directory")
         self.wait_for_jobs(2)
         self.store.set_album(self.store.sources()[0]["id"], "Mock Album")
+        self.confirm_pending(self.store.sources()[0]["id"])
         self.store.set_source_upload(self.store.sources()[0]["id"], True)
         self.store.allow_upload = True
         self.store.cli = self.base / "mock_cli_binary"
@@ -576,6 +702,7 @@ assert.deepStrictEqual(calc(999, 2), {
         self.store.add_source(str(self.media1), "file")
         self.wait_for_jobs(1)
         self.store.set_album(self.store.sources()[0]["id"], "Mock Album")
+        self.confirm_pending(self.store.sources()[0]["id"])
         self.store.set_source_upload(self.store.sources()[0]["id"], True)
         self.store.allow_upload = True
         self.store.cli = self.base / "cli"
@@ -602,6 +729,8 @@ assert.deepStrictEqual(calc(999, 2), {
         self.store.add_source(str(self.media1), "file")
         self.wait_for_jobs(1)
         source_id = self.store.sources()[0]["id"]
+        self.store.set_album(source_id, "source")
+        self.confirm_pending(source_id)
         self.store._set_source(source_id, enabled=False)
         self.assertEqual(self.store.jobs()[0]["status"], "paused")
         self.store._set_source(source_id, enabled=True)
@@ -650,6 +779,9 @@ assert.deepStrictEqual(calc(999, 2), {
         status, payload = req("GET", "/api/status")
         self.assertEqual(status, 200)
         token = payload["csrf"]
+        status, progress = req("GET", "/api/progress")
+        self.assertEqual(status, 200)
+        self.assertIn("queue", progress)
         status, _ = req("POST", "/api/monitor", {"enabled": True})
         self.assertEqual(status, 403)
         status, _ = req("POST", "/api/monitor", {"enabled": True},
@@ -710,6 +842,21 @@ assert.deepStrictEqual(calc(999, 2), {
         self.assertEqual(status, 200)
         self.assertEqual(self.store.sources()[0]["album_name"], "旅行相册")
         self.assertEqual(self.store.sources()[0]["album_confirmed"], 1)
+        status, scan_result = req("POST", "/api/source/scan", {"id": source_id},
+                                  {"X-GU-CSRF": token})
+        self.assertEqual(status, 200)
+        self.assertTrue(scan_result["scan_queued"])
+        self.wait_for_jobs(1)
+        status, pending = req("GET", "/api/jobs?source_id=" + str(source_id) +
+                              "&status=pending_review")
+        self.assertEqual(status, 200)
+        self.assertEqual(pending["total"], 1)
+        status, confirmation = req("POST", "/api/source/scan/confirm",
+                                   {"id": source_id, "job_ids": [job_id]},
+                                   {"X-GU-CSRF": token})
+        self.assertEqual(status, 200)
+        self.assertEqual(confirmation["confirmation"]["confirmed_count"], 1)
+        self.assertEqual(self.store.jobs()[0]["status"], "queued")
         status, permission = req("POST", "/api/source/upload",
                                  {"id": source_id, "enabled": True},
                                  {"X-GU-CSRF": token})

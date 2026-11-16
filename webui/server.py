@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from contextlib import contextmanager
 from datetime import datetime
 import hashlib
@@ -30,7 +31,6 @@ IMAGE_EXTS = MEDIA - VIDEO_EXTS
 MIN_SIZE = 10240
 MAX_SCAN_FILES = 10000
 MAX_REQUEST_BYTES = 16384
-POLL_INTERVAL = 30
 PINNED_MAC_CLI_SHA256 = "d697e23c648881cf5e7db7b93f815f6d3dcbd9d7718a40d0edffee90456b0557"
 
 
@@ -73,11 +73,16 @@ class Store:
         self.scan_lock = threading.Lock()
         self.scan_request_lock = threading.Lock()
         self.scan_pending = False
+        self.scan_pending_source_ids = set()
         self.scan_thread_running = False
         self.scan_thread = None
         self.scan_running = False
+        self.scanning_sources = set()
         self.last_scan = None
         self.last_scan_error = None
+        self.last_scan_report = None
+        self.progress_lock = threading.RLock()
+        self.live_progress = None
         self.stop_event = threading.Event()
         self.wake_event = threading.Event()
         self._initialize()
@@ -103,8 +108,6 @@ class Store:
         if worker:
             self.thread = threading.Thread(target=self._worker_loop, daemon=True, name="gu-webui-worker")
             self.thread.start()
-            if self.monitor_enabled:
-                self.request_scan()
 
     @contextmanager
     def connection(self):
@@ -163,6 +166,9 @@ class Store:
                 error TEXT NOT NULL DEFAULT '',
                 media_key TEXT NOT NULL DEFAULT '',
                 duplicate_of INTEGER,
+                change_kind TEXT NOT NULL DEFAULT '',
+                completed_at TEXT NOT NULL DEFAULT '',
+                duration_seconds REAL NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL
               );
               CREATE INDEX IF NOT EXISTS idx_jobs_work ON jobs(status,retry_at);
@@ -190,6 +196,28 @@ class Store:
               );
               CREATE INDEX IF NOT EXISTS idx_source_events_id
                 ON source_events(source_id,id);
+              CREATE TABLE IF NOT EXISTS job_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                name TEXT NOT NULL,
+                source_id INTEGER NOT NULL,
+                bytes INTEGER NOT NULL,
+                digest TEXT NOT NULL,
+                mtime_ns INTEGER NOT NULL DEFAULT 0,
+                ctime_ns INTEGER NOT NULL DEFAULT 0,
+                media_kind TEXT NOT NULL DEFAULT '',
+                extension TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL,
+                media_key TEXT NOT NULL DEFAULT '',
+                duplicate_of INTEGER,
+                cloud_verified_at TEXT NOT NULL DEFAULT '',
+                cloud_verify_method TEXT NOT NULL DEFAULT '',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                archived_at TEXT NOT NULL
+              );
+              CREATE INDEX IF NOT EXISTS idx_job_history_job ON job_history(job_id,id);
               CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -220,6 +248,9 @@ class Store:
                 "cloud_verified_at": "TEXT NOT NULL DEFAULT ''",
                 "cloud_verify_method": "TEXT NOT NULL DEFAULT ''",
                 "ctime_ns": "INTEGER NOT NULL DEFAULT 0",
+                "change_kind": "TEXT NOT NULL DEFAULT ''",
+                "completed_at": "TEXT NOT NULL DEFAULT ''",
+                "duration_seconds": "REAL NOT NULL DEFAULT 0",
             }
             for table, columns in (("sources", source_cols), ("jobs", job_cols)):
                 existing = {r["name"] for r in con.execute(f"PRAGMA table_info({table})")}
@@ -413,9 +444,14 @@ class Store:
                        (SELECT COUNT(*) FROM jobs j WHERE j.source_id=s.id AND j.media_kind='video') AS videos,
                        (SELECT COUNT(*) FROM jobs j WHERE j.source_id=s.id AND j.status='api_accepted') AS api_accepted,
                        (SELECT COUNT(*) FROM jobs j WHERE j.source_id=s.id AND j.status='uploading') AS uploading,
+                       (SELECT COUNT(*) FROM jobs j WHERE j.source_id=s.id AND j.status='pending_review') AS pending_review_count,
+                       (SELECT COALESCE(SUM(j.bytes),0) FROM jobs j WHERE j.source_id=s.id AND j.status='pending_review') AS pending_review_bytes,
+                       (SELECT COUNT(*) FROM jobs j WHERE j.source_id=s.id AND j.status='pending_review' AND j.change_kind='changed') AS changed_count,
                        (SELECT COUNT(*) FROM jobs j WHERE j.source_id=s.id AND j.cloud_verified_at!='') AS cloud_verified
                        FROM sources s WHERE (?=1 OR s.ui_visibility='visible')
                        ORDER BY s.archived,s.id DESC""", (int(include_hidden),))]
+        for row in rows:
+            row["scanning"] = row["id"] in self.scanning_sources
         return rows
 
     def source_events(self, source_id):
@@ -547,7 +583,7 @@ class Store:
         if kind in ("image", "video"):
             query += " AND media_kind=?"
             params.append(kind)
-        if status in ("queued", "uploading", "retrying", "failed", "interrupted", "paused",
+        if status in ("pending_review", "queued", "uploading", "retrying", "failed", "interrupted", "paused",
                       "api_accepted", "duplicate"):
             query += " AND status=?"
             params.append(status)
@@ -563,7 +599,7 @@ class Store:
         query = """SELECT id,path,name,source_id,bytes,digest,status,attempts,
                    media_kind,extension,first_seen_at,last_seen_at,
                    file_available,cloud_verified_at,cloud_verify_method,
-                   retry_at,error,duplicate_of,updated_at"""
+                   retry_at,error,duplicate_of,change_kind,completed_at,duration_seconds,updated_at"""
         clause, params = self._jobs_filter(source_id, kind, status, include_hidden)
         query += clause + " ORDER BY id DESC LIMIT ? OFFSET ?"
         params.extend((min(500, max(1, int(limit))), min(1000000, max(0, int(offset)))))
@@ -605,6 +641,7 @@ class Store:
                 "owned_build_verified": owned_verified,
                 "scan_running": self.scan_running,
                 "last_scan": self.last_scan, "last_scan_error": self.last_scan_error,
+                "last_scan_report": self.last_scan_report,
                 "sources": self.sources(include_hidden=include_hidden),
                 "hidden_sources": hidden_sources,
                 "stored_files": stored_files,
@@ -612,7 +649,8 @@ class Store:
                 "indexed": {k: indexed[k] or 0 for k in indexed.keys()},
                 "supported_formats": {"image": sorted(IMAGE_EXTS), "video": sorted(VIDEO_EXTS)},
                 "cloud_verification": "not_available",
-                "progress_source": "API status only; no confirmed byte-level upload %"}
+                "progress_source": "gotohp JSONL byte events; actual request-body bytes",
+                "upload_progress": self.progress_snapshot()}
 
     def add_source(self, raw, kind):
         if kind not in ("directory", "file"):
@@ -638,20 +676,21 @@ class Store:
             source = con.execute("SELECT id FROM sources WHERE path=?", (path,)).fetchone()
             con.execute("""UPDATE sources SET album_name=? WHERE id=? AND album_name=''""",
                         (Path(path).name, source["id"]))
-            # A suggested folder name is not consent to upload. A new source
-            # must confirm its album and enable uploading explicitly.
-            # Explicit re-addition resumes saved paused tasks, preserving
-            # accepted, duplicate, failed and manually-verified history.
             if prior:
+                # A reattached source may have queued jobs paused when it was
+                # disabled. Restore their queue state, but upload_ready stays
+                # OFF so reattachment alone never authorizes an upload.
                 con.execute("""UPDATE jobs SET status='queued',updated_at=?
                                WHERE source_id=? AND status='paused'""",
                             (now(), source["id"]))
+            # A suggested folder name is not consent to upload. A new source
+            # must confirm its album and enable uploading explicitly.
             self._event(con, source["id"],
                         "reload" if prior else "added",
                         "复用原索引与所有备份状态" if prior else "新增来源")
         # A re-addition refreshes the known path. Unchanged files are handled
         # by the cached size/mtime/ctime branch without rehashing the media.
-        self.request_scan()
+        self.request_scan(source["id"])
         self.wake_event.set()
         return self.sources()
 
@@ -679,7 +718,6 @@ class Store:
                     con.execute("""UPDATE jobs SET status='queued',updated_at=?
                                    WHERE source_id=? AND status='paused'""", (now(), source_id))
         if enabled:
-            self.request_scan()
             self.wake_event.set()
 
     def restore_source(self, source_id):
@@ -695,9 +733,10 @@ class Store:
                            availability='unknown',
                            last_checked_at=? WHERE id=?""", (now(), source_id))
             con.execute("""UPDATE jobs SET status='queued',updated_at=?
-                           WHERE source_id=? AND status='paused'""", (now(), source_id))
+                           WHERE source_id=? AND status='paused'""",
+                        (now(), int(source_id)))
             self._event(con, source_id, "restored", "保留既有媒体索引和上传状态")
-        self.request_scan()
+        self.request_scan(int(source_id))
         self.wake_event.set()
         return self.sources()
 
@@ -713,8 +752,9 @@ class Store:
         self._rebuild_folder_index(source_id)
 
     def _add_job(self, source_id, file, scan_token=""):
+        """Index one stable media file; new/changed content waits for human review."""
         if not self._eligible(file):
-            return
+            return "ignored"
         try:
             before = file.stat()
             size = before.st_size
@@ -722,50 +762,70 @@ class Store:
             ctime_ns = before.st_ctime_ns
             extension = file.suffix.lstrip(".").lower()
             media_kind = "video" if extension in VIDEO_EXTS else "image"
+            path = str(file)
             with self.connection() as con:
-                cached = con.execute("SELECT bytes,mtime_ns,ctime_ns FROM jobs WHERE path=?", (str(file),)).fetchone()
+                cached = con.execute("SELECT * FROM jobs WHERE path=?", (path,)).fetchone()
                 if (cached and cached["bytes"] == size and cached["mtime_ns"] == mtime_ns
                         and cached["ctime_ns"] == ctime_ns):
                     con.execute("""UPDATE jobs SET source_id=?,last_seen_at=?,last_scan_token=?,
-                                   file_available=1,media_kind=?,extension=? WHERE path=?""",
-                                (source_id, now(), scan_token, media_kind, extension, str(file)))
-                    return  # Keep recurring scans cheap even with multi-GB media.
+                                   file_available=1,media_kind=?,extension=? WHERE id=?""",
+                                (source_id, now(), scan_token, media_kind, extension, cached["id"]))
+                    return "existing"
+                if cached and cached["status"] == "uploading":
+                    return "active"
             digest = self._digest(file)
             after = file.stat()
             if (before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns
                     or before.st_ctime_ns != after.st_ctime_ns):
-                return  # Never enqueue an incomplete/changing file.
+                return "unstable"
         except OSError:
-            return
-        path = str(file)
+            return "unavailable"
         with self.connection() as con:
-            previous = con.execute("SELECT id,bytes,digest,status FROM jobs WHERE path=?", (path,)).fetchone()
+            previous = con.execute("SELECT * FROM jobs WHERE path=?", (path,)).fetchone()
             if previous and previous["bytes"] == size and previous["digest"] == digest:
                 con.execute("""UPDATE jobs SET source_id=?,mtime_ns=?,ctime_ns=?,media_kind=?,extension=?,
                                last_seen_at=?,last_scan_token=?,file_available=1 WHERE id=?""",
                             (source_id, mtime_ns, ctime_ns, media_kind, extension,
                              now(), scan_token, previous["id"]))
-                return
+                return "existing"
             accepted = con.execute("""SELECT id FROM jobs WHERE digest=? AND status='api_accepted'
                                       ORDER BY id LIMIT 1""", (digest,)).fetchone()
-            state = "duplicate" if accepted else "queued"
+            state = "duplicate" if accepted else "pending_review"
             if previous:
+                # Preserve the previous uploaded/verified version before replacing
+                # the current path snapshot with the newly observed file content.
+                con.execute("""INSERT INTO job_history
+                    (job_id,path,name,source_id,bytes,digest,mtime_ns,ctime_ns,media_kind,extension,
+                     status,media_key,duplicate_of,cloud_verified_at,cloud_verify_method,attempts,
+                     updated_at,archived_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (previous["id"], previous["path"], previous["name"], previous["source_id"],
+                     previous["bytes"], previous["digest"], previous["mtime_ns"], previous["ctime_ns"],
+                     previous["media_kind"], previous["extension"], previous["status"],
+                     previous["media_key"], previous["duplicate_of"], previous["cloud_verified_at"],
+                     previous["cloud_verify_method"], previous["attempts"], previous["updated_at"], now()))
                 con.execute("""UPDATE jobs SET source_id=?,name=?,bytes=?,digest=?,mtime_ns=?,ctime_ns=?,
                                 media_kind=?,extension=?,last_seen_at=?,last_scan_token=?,file_available=1,
                                 cloud_verified_at='',cloud_verify_method='',status=?,attempts=0,
-                                retry_at=0,error='',media_key='',duplicate_of=?,updated_at=? WHERE id=?""",
+                                retry_at=0,error=?,media_key='',duplicate_of=?,change_kind=?,completed_at='',
+                                duration_seconds=0,updated_at=? WHERE id=?""",
                             (source_id, file.name, size, digest, mtime_ns, ctime_ns, media_kind, extension,
                              now(), scan_token, state,
-                             accepted["id"] if accepted else None, now(), previous["id"]))
-            else:
-                con.execute("""INSERT INTO jobs
-                               (path,name,source_id,bytes,digest,mtime_ns,ctime_ns,media_kind,extension,
-                                first_seen_at,last_seen_at,last_scan_token,file_available,
-                                status,duplicate_of,updated_at)
-                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?)""",
-                            (path, file.name, source_id, size, digest, mtime_ns, ctime_ns, media_kind,
-                             extension, now(), now(), scan_token, state,
-                             accepted["id"] if accepted else None, now()))
+                             "检测到文件内容变化，等待确认新版本" if state == "pending_review" else "",
+                             accepted["id"] if accepted else None,
+                             "changed" if state == "pending_review" else "duplicate",
+                             now(), previous["id"]))
+                return "changed" if state == "pending_review" else "duplicate"
+            con.execute("""INSERT INTO jobs
+                           (path,name,source_id,bytes,digest,mtime_ns,ctime_ns,media_kind,extension,
+                            first_seen_at,last_seen_at,last_scan_token,file_available,status,duplicate_of,
+                            change_kind,updated_at)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?)""",
+                        (path, file.name, source_id, size, digest, mtime_ns, ctime_ns, media_kind,
+                         extension, now(), now(), scan_token, state,
+                         accepted["id"] if accepted else None,
+                         "duplicate" if accepted else "new", now()))
+            return "duplicate" if accepted else "new"
 
     def _rebuild_folder_index(self, source_id):
         """Persist per-directory historical counts without accessing source media."""
@@ -802,37 +862,54 @@ class Store:
                             VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                             [(source_id, folder, *values, now()) for folder, values in totals.items()])
 
-    def scan(self):
-        # Explicit scans wait their turn; do not silently skip a disconnected
-        # network share check because another scan happens to be running.
+    def scan(self, source_id=None, source_ids=None):
+        """Explicitly scan selected sources; discovered new/changed media needs approval."""
         self.scan_lock.acquire()
         self.scan_running = True
         self.last_scan_error = None
+        report = {"new": 0, "changed": 0, "existing": 0, "duplicate": 0,
+                  "unavailable": 0, "unstable": 0, "missing": 0, "scanned_entries": 0,
+                  "source_ids": []}
         try:
             seen = 0
             mounted = {v["path"] for v in self._mounted_volumes()}
-            for source in self.sources():
-                if not source["enabled"] or source["archived"]:
-                    continue
+            selected = set(int(x) for x in (source_ids or []))
+            if source_id is not None:
+                selected.add(int(source_id))
+            sources = [s for s in self.sources() if not s["archived"] and
+                       (not selected or s["id"] in selected)]
+            for source in sources:
                 path = Path(source["path"])
-                source_id = source["id"]
+                sid = source["id"]
+                report["source_ids"].append(sid)
+                self.scanning_sources.add(sid)
                 remote_offline = (source["location_kind"] == "network" and
                                   source["mount_root"] not in mounted)
                 if remote_offline or not path.exists():
                     self.last_scan_error = "部分来源暂不可用（网络共享或外置磁盘已断开），保留历史任务"
                     with self.connection() as con:
                         con.execute("""UPDATE sources SET availability='offline',last_checked_at=?
-                                       WHERE id=?""", (now(), source_id))
-                        con.execute("UPDATE jobs SET file_available=0 WHERE source_id=?", (source_id,))
-                    self._rebuild_folder_index(source_id)
+                                       WHERE id=?""", (now(), sid))
+                        con.execute("UPDATE jobs SET file_available=0 WHERE source_id=?", (sid,))
+                    report["unavailable"] += 1
+                    self._rebuild_folder_index(sid)
+                    self.scanning_sources.discard(sid)
                     continue
                 token = secrets.token_hex(12)
                 complete = True
+
                 def record_error(_error):
                     nonlocal complete
                     complete = False
+
+                def record_file(file):
+                    result = self._add_job(sid, file, token)
+                    report["scanned_entries"] += 1
+                    if result in ("new", "changed", "existing", "duplicate", "unavailable", "unstable"):
+                        report[result] += 1
+
                 if source["kind"] == "file":
-                    self._add_job(source_id, path, token)
+                    record_file(path)
                     seen += 1
                 else:
                     for root, dirs, files in os.walk(path, followlinks=False, onerror=record_error):
@@ -844,7 +921,7 @@ class Store:
                                 continue
                             file = Path(root) / name
                             if file.suffix.lstrip(".").lower() in MEDIA:
-                                self._add_job(source_id, file, token)
+                                record_file(file)
                             seen += 1
                             if seen >= MAX_SCAN_FILES:
                                 complete = False
@@ -857,29 +934,53 @@ class Store:
                     complete = False
                 with self.connection() as con:
                     con.execute("""UPDATE sources SET availability=?,last_checked_at=? WHERE id=?""",
-                                ("online" if complete else "interrupted", now(), source_id))
+                                ("online" if complete else "interrupted", now(), sid))
                     if complete:
                         con.execute("""UPDATE jobs SET file_available=0 WHERE source_id=?
-                                       AND last_scan_token!=?""", (source_id, token))
+                                       AND last_scan_token!=? AND status!='uploading'""", (sid, token))
                 if not complete and not self.last_scan_error:
                     self.last_scan_error = "来源扫描中断，已保留此前索引记录"
-                self._rebuild_folder_index(source_id)
+                self._rebuild_folder_index(sid)
+                self.scanning_sources.discard(sid)
                 if seen >= MAX_SCAN_FILES:
                     break
+            with self.connection() as con:
+                for sid in report["source_ids"]:
+                    pending = con.execute("""SELECT COUNT(*) n,COALESCE(SUM(bytes),0) b
+                                             FROM jobs WHERE source_id=? AND status='pending_review'""",
+                                          (sid,)).fetchone()
+                    missing = con.execute("""SELECT COUNT(*) n FROM jobs
+                                             WHERE source_id=? AND file_available=0""",
+                                          (sid,)).fetchone()
+                    report.setdefault("pending_count", 0)
+                    report.setdefault("pending_bytes", 0)
+                    report["pending_count"] += pending["n"]
+                    report["pending_bytes"] += pending["b"]
+                    report["missing"] += missing["n"]
             self.last_scan = now()
-            return True
+            report["finished_at"] = self.last_scan
+            report["error"] = self.last_scan_error
+            self.last_scan_report = report
+            return report
         except Exception as exc:
             self.last_scan_error = "扫描错误：" + type(exc).__name__
-            return False
+            report["error"] = self.last_scan_error
+            self.last_scan_report = report
+            return report
         finally:
+            self.scanning_sources.clear()
             self.scan_running = False
             self.scan_lock.release()
 
-    def request_scan(self):
+    def request_scan(self, source_id=None):
         with self.scan_request_lock:
             if self.stop_event.is_set():
                 return
-            self.scan_pending = True
+            if source_id is None:
+                self.scan_pending = True
+                self.scan_pending_source_ids.clear()
+            elif not self.scan_pending:
+                self.scan_pending_source_ids.add(int(source_id))
             if self.scan_thread_running:
                 return
             self.scan_thread_running = True
@@ -890,18 +991,23 @@ class Store:
     def _scan_runner(self):
         while not self.stop_event.is_set():
             with self.scan_request_lock:
-                if not self.scan_pending:
+                if not self.scan_pending and not self.scan_pending_source_ids:
                     self.scan_thread_running = False
                     return
-                self.scan_pending = False
-            self.scan()
+                if self.scan_pending:
+                    source_ids = None
+                    self.scan_pending = False
+                    self.scan_pending_source_ids.clear()
+                else:
+                    source_ids = sorted(self.scan_pending_source_ids)
+                    self.scan_pending_source_ids.clear()
+            self.scan(source_ids=source_ids)
         with self.scan_request_lock:
             self.scan_thread_running = False
 
     def set_monitor(self, enabled):
+        # Compatibility switch only; directory scanning is always explicit.
         self.monitor_enabled = bool(enabled)
-        if enabled:
-            self.request_scan()
         self.wake_event.set()
 
     def set_auto_sync(self, enabled):
@@ -916,8 +1022,6 @@ class Store:
         self.auto_sync_requested = enabled
         self.monitor_enabled = enabled
         self.upload_enabled = enabled
-        if enabled:
-            self.request_scan()
         # A stop prevents the NEXT file; an in-flight file may finish safely.
         self.wake_event.set()
 
@@ -944,6 +1048,53 @@ class Store:
                         "用户明确允许上传" if enabled else "用户暂停来源上传；保留队列")
         self.wake_event.set()
         return self.sources()
+
+    def confirm_scan(self, source_id, job_ids):
+        """Explicitly approve only the selected scan candidates for normal queueing."""
+        if not isinstance(job_ids, list) or not job_ids or len(job_ids) > 500:
+            raise UserError("请选择 1–500 个待确认文件")
+        try:
+            selected = sorted({int(value) for value in job_ids})
+        except (TypeError, ValueError):
+            raise UserError("扫描确认列表包含无效文件 ID")
+        with self.connection() as con:
+            source = con.execute("""SELECT id,enabled,upload_ready,archived,ui_visibility,album_confirmed,
+                                    album_name,upload_quality FROM sources WHERE id=?""",
+                                 (int(source_id),)).fetchone()
+            if not source or source["archived"] or source["ui_visibility"] != "visible":
+                raise UserError("请先恢复并显示此来源")
+            if not source["album_confirmed"] or not source["album_name"]:
+                raise UserError("请先保存并确认目标 Google Photos 相册")
+            if source["upload_quality"] not in ("storage_saver", "original"):
+                raise UserError("请先选择有效的上传画质")
+            placeholders = ",".join("?" for _ in selected)
+            rows = con.execute(
+                f"""SELECT id,path,bytes,mtime_ns,ctime_ns FROM jobs
+                    WHERE source_id=? AND status='pending_review' AND id IN ({placeholders})""",
+                [int(source_id), *selected]).fetchall()
+            if len(rows) != len(selected):
+                raise UserError("部分文件已不在待确认列表，请刷新扫描结果后再试")
+            stale = []
+            for row in rows:
+                try:
+                    info = Path(row["path"]).stat()
+                    if (not Path(row["path"]).is_file() or info.st_size != row["bytes"] or
+                            info.st_mtime_ns != row["mtime_ns"] or info.st_ctime_ns != row["ctime_ns"]):
+                        stale.append(row["id"])
+                except OSError:
+                    stale.append(row["id"])
+            if stale:
+                raise UserError("有文件在扫描后发生变化或已离线，请重新执行增量扫描")
+            total_bytes = sum(row["bytes"] for row in rows)
+            con.executemany("""UPDATE jobs SET status='queued',change_kind='',error='',
+                               updated_at=? WHERE id=? AND status='pending_review'""",
+                            [(now(), row["id"]) for row in rows])
+            self._event(con, int(source_id), "scan_confirmed",
+                        f"用户确认 {len(rows)} 个文件进入上传队列，共 {total_bytes} 字节")
+        self.wake_event.set()
+        return {"confirmed_count": len(rows), "confirmed_bytes": total_bytes,
+                "job_ids": selected, "upload_enabled": self.upload_enabled,
+                "source_upload_ready": bool(source["upload_ready"])}
 
     def _auth_ready(self):
         return (self.allow_upload and self.cli.is_file() and self.credentials.is_file()
@@ -984,7 +1135,7 @@ class Store:
         self.wake_event.set()
 
     def _next_job(self, *, source_id=None, image_only=False, allow_unready=False,
-                  job_id=None):
+                  allow_pending_review=False, job_id=None):
         args = [time.time()]
         condition = ""
         if source_id is not None:
@@ -1006,9 +1157,139 @@ class Store:
                  AND (s.album_key!='' OR NOT EXISTS (
                       SELECT 1 FROM jobs old WHERE old.source_id=s.id
                       AND old.status='api_accepted'))
-                 WHERE (j.status='queued' OR (j.status='retrying' AND j.retry_at<=?))
+                 WHERE (j.status='queued' OR (j.status='retrying' AND j.retry_at<=?)""" +
+                 (" OR j.status='pending_review'" if allow_pending_review else "") + """)
                    AND j.file_available=1 """ + condition +
                  " ORDER BY " + ordering + " LIMIT 1", args).fetchone()
+
+    def _begin_progress(self, job):
+        with self.progress_lock:
+            self.live_progress = {
+                "job_id": int(job["id"]), "source_id": int(job["source_id"]),
+                "file_name": job["name"], "status": "starting",
+                "bytes_uploaded": 0, "bytes_total": int(job["bytes"]),
+                "attempt": 0, "started_at": now(),
+                "started_monotonic": time.monotonic(),
+                "last_sample_at": None, "last_sample_bytes": 0,
+                "samples": deque(maxlen=12), "speed_bps": 0.0,
+            }
+
+    def _consume_cli_progress(self, job_id, line_or_event):
+        if isinstance(line_or_event, str):
+            try:
+                event = json.loads(line_or_event)
+            except (ValueError, TypeError):
+                return
+        elif isinstance(line_or_event, dict):
+            event = line_or_event
+        else:
+            return
+        if event.get("event") != "thread_status":
+            return
+        with self.progress_lock:
+            current = self.live_progress
+            if not current or current["job_id"] != int(job_id):
+                return
+            current["status"] = str(event.get("status") or current["status"])[:32]
+            current["file_name"] = str(event.get("file_name") or current["file_name"])[:255]
+            current["attempt"] = max(0, int(event.get("attempt") or 0))
+            uploaded = max(0, int(event.get("bytes_uploaded") or 0))
+            total = max(0, int(event.get("bytes_total") or current["bytes_total"]))
+            current["bytes_uploaded"] = min(uploaded, total) if total else uploaded
+            current["bytes_total"] = total
+            if current["status"] != "uploading" or total <= 0:
+                return
+            sampled_at = time.monotonic()
+            if current["attempt"] != current.get("sample_attempt"):
+                current["samples"].clear()
+                current["last_sample_at"] = None
+                current["sample_attempt"] = current["attempt"]
+            previous_at = current["last_sample_at"]
+            previous_bytes = current["last_sample_bytes"]
+            if previous_at is None:
+                current["samples"].append((sampled_at, uploaded))
+            elif sampled_at > previous_at and uploaded >= previous_bytes:
+                current["samples"].append((sampled_at, uploaded))
+            current["last_sample_at"] = sampled_at
+            current["last_sample_bytes"] = uploaded
+            samples = current["samples"]
+            if len(samples) >= 2:
+                elapsed = samples[-1][0] - samples[0][0]
+                if elapsed > 0:
+                    current["speed_bps"] = max(0.0, (samples[-1][1] - samples[0][1]) / elapsed)
+
+    def _finish_progress(self, job_id):
+        with self.progress_lock:
+            if self.live_progress and self.live_progress["job_id"] == int(job_id):
+                self.live_progress = None
+
+    def progress_snapshot(self):
+        with self.progress_lock:
+            current = dict(self.live_progress) if self.live_progress else None
+            if current:
+                current["samples"] = list(current.get("samples", []))
+        with self.connection() as con:
+            counts = {row["status"]: row["n"] for row in con.execute(
+                "SELECT status,COUNT(*) n FROM jobs GROUP BY status")}
+            totals = con.execute("""SELECT
+                COALESCE(SUM(CASE WHEN status IN ('api_accepted','duplicate') THEN 1 ELSE 0 END),0) done,
+                COALESCE(SUM(CASE WHEN status IN ('api_accepted','duplicate','pending_review','queued','retrying','uploading','failed','paused','interrupted') THEN 1 ELSE 0 END),0) total,
+                COALESCE(SUM(CASE WHEN status IN ('api_accepted','duplicate') THEN bytes ELSE 0 END),0) done_bytes,
+                COALESCE(SUM(CASE WHEN status IN ('api_accepted','duplicate','pending_review','queued','retrying','uploading','failed','paused','interrupted') THEN bytes ELSE 0 END),0) total_bytes
+                FROM jobs""").fetchone()
+            durations = [float(row["duration_seconds"]) for row in con.execute(
+                """SELECT duration_seconds FROM jobs WHERE status='api_accepted'
+                   AND duration_seconds>0 ORDER BY completed_at DESC,id DESC LIMIT 20""")]
+            last = con.execute("""SELECT name,bytes,COALESCE(NULLIF(completed_at,''),updated_at) completed_at
+                                  FROM jobs WHERE status='api_accepted'
+                                  ORDER BY COALESCE(NULLIF(completed_at,''),updated_at) DESC,id DESC LIMIT 1""").fetchone()
+        average = sum(durations) / len(durations) if durations else None
+        current_out = None
+        current_eta = None
+        if current:
+            elapsed = max(0.0, time.monotonic() - current["started_monotonic"])
+            speed = max(0.0, float(current.get("speed_bps") or 0))
+            total = int(current.get("bytes_total") or 0)
+            uploaded = int(current.get("bytes_uploaded") or 0)
+            percent = round(min(100.0, uploaded * 100.0 / total)) if total else None
+            if current.get("status") == "uploading" and speed > 0 and total >= uploaded:
+                current_eta = (total - uploaded) / speed
+            current_out = {
+                "job_id": current["job_id"], "source_id": current["source_id"],
+                "file_name": current["file_name"], "status": current["status"],
+                "bytes_uploaded": uploaded, "bytes_total": total, "percent": percent,
+                "speed_bps": speed, "elapsed_seconds": elapsed,
+                "eta_seconds": current_eta, "attempt": current["attempt"],
+                "started_at": current["started_at"],
+            }
+        uploadable_remaining = int(counts.get("queued", 0) + counts.get("retrying", 0))
+        pending_review = int(counts.get("pending_review", 0))
+        done = int(totals["done"] or 0)
+        total = int(totals["total"] or 0)
+        data_total = int(totals["total_bytes"] or 0)
+        data_done = int(totals["done_bytes"] or 0)
+        queue_eta = None
+        # A queue ETA is deliberately withheld until there are at least three
+        # completed samples; a single file is too noisy to extrapolate from.
+        if average is not None and len(durations) >= 3 and (uploadable_remaining or current):
+            queue_eta = average * uploadable_remaining
+            if current:
+                queue_eta += current_eta if current_eta is not None else max(0.0, average - current_out["elapsed_seconds"])
+        return {
+            "current": current_out,
+            "last_completed": ({"file_name": last["name"], "bytes": last["bytes"],
+                                "completed_at": last["completed_at"]} if last else None),
+            "queue": {
+                "done": done, "total": total, "remaining": max(0, total - done),
+                "uploadable_remaining": uploadable_remaining,
+                "pending_review": pending_review,
+                "percent": round(done * 100 / total) if total else 0,
+                "data_done_bytes": data_done, "data_total_bytes": data_total,
+                "data_percent": round(data_done * 100 / data_total) if data_total else 0,
+                "average_file_seconds": average, "average_sample_count": len(durations),
+                "eta_seconds": queue_eta,
+            },
+        }
 
     def _run_upload(self, job, *, quality_override=None):
         """Only called when explicit credentials, env gate and UI enable all hold."""
@@ -1036,19 +1317,57 @@ class Store:
             if prior:
                 return False, "", "旧相册 ID 未绑定，请先确认目标相册后再继续", ""
         timeout = min(21600, max(600, job["bytes"] // 51200))
-        cmd = [str(self.cli), "--config", str(self.credentials), "upload", "--no-tui"]
+        cmd = [str(self.cli), "--config", str(self.credentials), "upload",
+               "--no-tui", "--json-progress"]
         if effective_quality == "storage_saver":
             cmd.append("--saver")
         cmd.extend(["--album", source["album_key"] or source["album_name"], str(path)])
+        process = None
+        stdout_parts = []
+        reader_errors = []
+
+        def drain_stdout():
+            try:
+                stdout_parts.append(process.stdout.read())
+            except Exception as exc:
+                reader_errors.append(type(exc).__name__)
+
+        def drain_progress():
+            try:
+                for line in process.stderr:
+                    # JSONL records are newline-delimited; pass a normalized
+                    # single record to the parser/telemetry hook.
+                    self._consume_cli_progress(job["id"], line.rstrip("\r\n"))
+            except Exception as exc:
+                reader_errors.append(type(exc).__name__)
+
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True,
-                                    timeout=timeout, check=False)
-        except (OSError, subprocess.TimeoutExpired) as exc:
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       text=True, bufsize=1)
+            stdout_thread = threading.Thread(target=drain_stdout, daemon=True)
+            progress_thread = threading.Thread(target=drain_progress, daemon=True)
+            stdout_thread.start()
+            progress_thread.start()
+            try:
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                stdout_thread.join(timeout=5)
+                progress_thread.join(timeout=5)
+                return False, "", "上传进程超时，已停止当前文件", ""
+            stdout_thread.join(timeout=10)
+            progress_thread.join(timeout=10)
+        except OSError as exc:
             return False, "", "上传进程异常：" + type(exc).__name__, ""
-        if result.returncode != 0:
-            return False, "", f"上传进程退出码 {result.returncode}（详情请在本机 CLI 排查）", ""
-        # Do not expose raw stdout (could hold private provider metadata).
-        output = result.stdout
+        finally:
+            if process is not None:
+                self._finish_progress(job["id"])
+        if process.returncode != 0:
+            return False, "", f"上传进程退出码 {process.returncode}（详情请在本机 CLI 排查）", ""
+        # stdout retains gotohp's final JSON summary; progress JSONL is isolated
+        # on stderr and never exposes local absolute paths or credentials.
+        output = "".join(stdout_parts)
         if re.search(r'"(?:error|message)"\s*:\s*"(?!")', output):
             return False, "", "API 返回错误", ""
         key = re.search(r'"mediaKey"\s*:\s*"([^"]{1,500})"', output)
@@ -1073,7 +1392,7 @@ class Store:
             self.upload_enabled = False
             return False
         job = self._next_job(source_id=source_id, image_only=image_only,
-                             allow_unready=manual, job_id=job_id)
+                             allow_unready=manual, allow_pending_review=manual, job_id=job_id)
         if job is None:
             return False
         with self.connection() as con:
@@ -1100,8 +1419,12 @@ class Store:
         if is_duplicate:
             self._rebuild_folder_index(job["source_id"])
             return True
+        started_monotonic = time.monotonic()
+        self._begin_progress(job)
         outcome = (self._run_upload(job, quality_override=quality_override)
                    if quality_override is not None else self._run_upload(job))
+        duration_seconds = max(0.0, time.monotonic() - started_monotonic)
+        self._finish_progress(job["id"])
         ok, media_key, error = outcome[:3]
         album_key = outcome[3] if len(outcome) > 3 else ""
         with self.connection() as con:
@@ -1110,8 +1433,10 @@ class Store:
                     con.execute("""UPDATE sources SET album_key=?
                                    WHERE id=? AND album_key=''""",
                                 (album_key, job["source_id"]))
-                con.execute("""UPDATE jobs SET status='api_accepted',media_key=?,error='',updated_at=?
-                               WHERE id=?""", (media_key, now(), job["id"]))
+                completed_at = now()
+                con.execute("""UPDATE jobs SET status='api_accepted',media_key=?,error='',
+                               completed_at=?,duration_seconds=?,updated_at=? WHERE id=?""",
+                            (media_key, completed_at, duration_seconds, completed_at, job["id"]))
                 con.execute("""UPDATE jobs SET status='duplicate',duplicate_of=?,updated_at=?
                                WHERE digest=? AND status IN ('queued','retrying')
                                AND id!=?""", (job["id"], now(), job["digest"], job["id"]))
@@ -1138,9 +1463,11 @@ class Store:
             raise UserError("来源不存在或已经暂停")
         if not selected["album_confirmed"]:
             raise UserError("请先确认相册名称，再进行单张测试")
-        candidate = self._next_job(source_id=source_id,image_only=True,allow_unready=True)
+        candidate = self._next_job(source_id=source_id,image_only=True,allow_unready=True,
+                                   allow_pending_review=True)
         if candidate is None:
-            candidate = self._next_job(image_only=True,allow_unready=True)
+            candidate = self._next_job(image_only=True,allow_unready=True,
+                                       allow_pending_review=True)
         if candidate is None:
             raise UserError("已确认的来源中没有待上传照片；请检查其他来源是否已扫描并确认相册")
         with self.connection() as con:
@@ -1176,11 +1503,7 @@ class Store:
                 "quality":candidate["quality"], "fallback":candidate["fallback"]}
 
     def _worker_loop(self):
-        next_poll = 0
         while not self.stop_event.is_set():
-            if self.monitor_enabled and time.time() >= next_poll:
-                self.request_scan()
-                next_poll = time.time() + POLL_INTERVAL
             if self.upload_enabled and self._auth_ready():
                 if self.run_one():
                     continue
@@ -1192,6 +1515,7 @@ class Store:
         self.wake_event.set()
         with self.scan_request_lock:
             self.scan_pending = False
+            self.scan_pending_source_ids.clear()
         if self.thread is not None:
             self.thread.join(timeout=3)
         if self.scan_thread is not None and self.scan_thread.is_alive():
@@ -1244,6 +1568,8 @@ def make_handler(store):
                 q = parse_qs(uri.query)
                 show_all = q.get("include_hidden", ["0"])[0] == "1"
                 return self._json(200, {**store.status(include_hidden=show_all), "csrf": csrf})
+            if uri.path == "/api/progress":
+                return self._json(200, store.progress_snapshot())
             if uri.path == "/api/source/test-candidate":
                 try:
                     q=parse_qs(uri.query)
@@ -1332,6 +1658,16 @@ def make_handler(store):
                 elif uri == "/api/source/upload":
                     result = {"sources": store.set_source_upload(
                         int(payload["id"]), payload.get("enabled") is True)}
+                elif uri == "/api/source/scan":
+                    source_id = int(payload["id"])
+                    if not any(s["id"] == source_id and not s["archived"]
+                               for s in store.sources(include_hidden=False)):
+                        raise UserError("请先恢复并显示此来源")
+                    store.request_scan(source_id)
+                    result = {"scan_queued": True, "source_id": source_id}
+                elif uri == "/api/source/scan/confirm":
+                    result = {"confirmation": store.confirm_scan(
+                        int(payload["id"]), payload.get("job_ids"))}
                 elif uri == "/api/source/test-upload":
                     result = {"test": store.test_one_image(int(payload["id"]),
                               expected_job_id=int(payload["candidate_id"])
