@@ -17,12 +17,14 @@ if [[ ! -x "$CLI" ]] || ! python3 "$ROOT/engine/verify_local_build.py"; then
 fi
 mkdir -p "$STATE"
 chmod 700 "$STATE"
-echo "本机独立账号授权：请先在已登录目标 Google 账号的 Chrome 配置文件中访问"
+echo "本机独立账号授权：请在目标 Google 账号的 Chrome 配置文件中访问"
 echo "https://accounts.google.com/EmbeddedSetup"
-echo "完成 Google 登录并同意。打开 Chrome 开发者工具 > Application > Cookies >"
-echo "https://accounts.google.com，只复制 oauth_token 的 Value。"
-echo "不要复制其它 Cookie，不要把值发送到 ChatGPT、NexusDock、GitHub 或任何网站。"
-echo "粘贴后终端不会显示，也不会将 Token 放在命令行参数里。"
+echo "页面持续转圈或未显示登录成功，不一定代表失败；保持页面打开并检查 Cookie。"
+echo "Chrome 开发者工具 > Application > Storage > Cookies >"
+echo "https://accounts.google.com，找到 oauth_token，只复制该行的 Value。"
+echo "如果没有 oauth_token 或 Value 为空，请重新尝试 Embedded Setup。"
+echo "不要复制其它 Cookie，不要把 Token 发给 ChatGPT、NexusDock、Agent 或 GitHub。"
+echo "将 Value 粘贴到下面的本机终端提示；输入会隐藏，不会出现在命令行参数中。"
 echo ""
 IFS= read -r -s -p "粘贴 oauth_token，然后按 Return: " AUTH_TOKEN
 printf '\n'

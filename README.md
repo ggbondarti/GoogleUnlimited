@@ -1,81 +1,79 @@
 # GoogleUnlimited
 
-一个在**自己电脑上运行**的 Google Photos 图片、视频自动备份工具。可直接读取已添加的本地文件夹、移动硬盘与 NAS/SMB 共享，通过本地 WebUI 管理同步。
+**维护者：[@samni728](https://github.com/samni728)**
 
-## 它是怎样工作的？
+在自己的 Mac 上运行 Google Photos 图片、视频备份工具。可扫描本地磁盘、移动硬盘及已挂载的 NAS/SMB 目录，通过本地 WebUI 管理上传和进度。
 
-1. **自己授权**：用户在本机完成 Google 登录授权，凭据仅保存在本机的私有配置文件。
-2. **自己编译**：项目使用固定版本的开源 [gotohp](https://github.com/xob0t/gotohp) 源码，由用户在本机编译上传程序，并验证源码和二进制哈希。**不是下载陌生人编译的程序直接运行。**
-3. **直接上传**：本机 gotohp 使用 Google Photos 的移动端上传接口，与 Google 服务通信，照片和视频**不经过本项目作者的中转服务器**。
-4. **记录进度**：SQLite 保存路径、文件哈希和上传结果。关闭/移除映射不删除源文件；重新挂载同一路径会识别历史记录，只继续未完成或新出现的媒体。
+## 工作方式
 
-这是一款非官方工具，gotohp 是第三方开源实现，并非本项目从零重写的协议，也不是 Google 官方客户端。Google 可能更改 API、设备识别及存储政策；**不能承诺永久免费或无限容量**。
+- 文件由本机直接上传到 Google Photos，不经过项目作者的中转服务器。
+- SQLite 保存文件索引、去重信息、相册绑定和任务状态；重新挂载后可续传，不删除源文件。
+- 上传程序基于固定版本的开源 [gotohp](https://github.com/xob0t/gotohp)，在本机自行编译并校验源码和二进制。
+- 本项目不是 Google 官方客户端。Google 可随时调整接口、账号资格及存储政策，不承诺永久免费或无限容量。
 
-## 快速开始（macOS Apple Silicon）
+## 安装与首次授权（macOS Apple Silicon）
 
-在终端进入你自己克隆的项目目录：
+在项目目录打开 Mac 本机 Terminal：
 
 ```bash
-cd GoogleUnlimited
 bash scripts/build_local_uploader.sh
 python3 engine/verify_local_build.py
 ```
 
-首次使用，在**本机**完成 Google 账号的 Embedded Setup 授权，再执行：
+### 获取 Google 授权 Token
+
+1. 使用**准备备份的 Google 账号**打开 Chrome 对应配置文件，访问 [Google Embedded Setup](https://accounts.google.com/EmbeddedSetup)。
+2. **页面一直转圈、停留在账号选择页，或没有显示登录成功，不一定代表授权失败。** 不必只等页面跳转；保持该页面打开，继续检查 Cookie。
+3. 打开 Chrome 开发者工具（macOS：`⌥⌘I`），进入 **Application → Storage → Cookies → https://accounts.google.com**。
+4. 在 Cookie 列表找到 **`oauth_token`**，只复制这一行的 **Value**。不要复制整份 Cookie，也不要复制其他名称的 Token。
+5. 如果没有 `oauth_token` 或 Value 为空，说明当前尚未取得可用凭据；返回 Embedded Setup 重新尝试，不要拿其他 Cookie 代替。
+
+### 将 Token 保存到本机
+
+在项目根目录运行：
 
 ```bash
 bash scripts/authorize_local.sh
 ```
 
-授权脚本使用隐藏输入，不要把 Cookie 或令牌发给聊天、远程 Agent 或 GitHub。
+脚本提示粘贴时，把刚才复制的 `oauth_token` **粘贴到 Mac Terminal 提示符**并按 Return。输入过程不会显示字符。这一步不是把 Token 粘贴回网页。
 
-启动 WebUI：
+授权成功后，凭据保存在本机私有文件 `webui/state/gotohp.config`，目录权限为 `700`、配置文件权限为 `600`。可按脚本提示运行 `creds list` 核对账号。**不要把 Token、Cookie 或配置文件内容发送给 ChatGPT、Agent、他人或 GitHub。** 授权脚本必须在本机交互式 Terminal 运行，不要通过远程命令执行。
+
+## 启动与同步
 
 ```bash
 python3 webui/server.py --port 8796 --engine owned --allow-real-upload
 ```
 
-在**同一台电脑**打开 http://127.0.0.1:8796，先添加来源（**只扫描，不会自行上传**），确认相册名称及画质，必要时先「仅试传 1 张照片」，之后分别点击该来源的「允许此来源上传」及全局「自动同步」才会开始批量上传。服务只监听 127.0.0.1，默认不向局域网或公网暴露。
+在同一台电脑打开 <http://127.0.0.1:8796>。服务仅监听本机地址。
 
-## 简单的同步逻辑
+- **添加来源只扫描和建立索引，不会立即上传。** 先检查目录、确认相册名称和画质。
+- 上传必须同时满足：顶部 **「自动同步 · 总开关」** 开启、来源 **「此来源同步」** 开启、相册已确认。
+- 想先测试时，关闭全局同步，使用 **「仅试传 1 张照片」**。确认文件、目标相册和画质后再执行。
+- 顶部停止会阻止领取新文件；当前已开始的单个文件可能完成。暂停来源不会清除队列或历史。
+- 已处理来源会收起到 **「查看已处理」**，不是删除或停用；以后新增文件仍可重新发现。
+- 隐藏、移除或断开来源不会删除原文件和 SQLite 历史。重新添加来源后，上传许可需重新确认。
+- **API 已接收不等于 Google 云端已人工核验。** 请在 Google Photos 媒体详情中抽查。
 
-- **添加来源**：只扫描和建立索引，默认不允许上传。文件夹名只是建议的相册名称，必须在来源设置中手工确认；首次明确允许上传后才创建相册并保存云端 ID，后续复用该相册。
-- **已有相册**：可在来源设置中粘贴 Google Photos 的相册链接进行绑定；若旧记录已经上传但缺少相册 ID，系统会阻止继续上传，直到绑定，避免重复创建。
-- **停止同步**：顶部「停止全部上传」立即禁止领取新文件；每个来源也有独立「暂停此来源上传」按钮。当前已经启动的一个文件可正常完成，其他队列与 SQLite 历史永久保留。
-- **移除映射或硬盘离线**：不删除原图和 SQLite 记录。重新添加/恢复来源会重新扫描，但**上传许可默认撤销**，必须再次点「允许此来源上传」才能加入批量队列。
-- **已上传**：不因重新扫描而重复上传。API 已接收与 Google 官方页面核验是两种不同状态。
-- **默认画质**：**Original quality（原始画质）**；新添加的来源默认使用原画质，既有来源保留自己已选择的画质，可在「高级设置」随时调整未来的上传。更改不会重传或修改已上传文件。
-- **单张测试**：在「自动同步」关闭时选择「仅试传 1 张照片」。优先从当前来源选择未上传照片；若当前来源已完成，可从其他已确认相册的来源挑选一张，**上传到该照片所属相册**，确认窗口会显示具体文件、目标相册和本次画质，不会启动批量任务。
+## 上传画质
 
-## 画质模式
+- **Original quality（默认）**：不传 `--saver`，请求按原始画质上传。
+- **Storage saver**：传入 `--saver`，Google 可能压缩或调整分辨率。
 
-| 模式 | 上传参数 | 说明 |
-| --- | --- | --- |
-| **Original quality（默认）** | 不传 `--saver` | 原始画质；是否计入配额，以 Google Photos 当前账户的媒体详情为准 |
-| Storage saver（可选） | `--saver` | Google 可能压缩或调整媒体画质，具体配额由 Google 判断 |
+画质选择只影响之后上传的文件，不会修改或重传已完成项目。首次使用或切换画质，建议先单张测试；最终画质和是否占用配额，以 Google Photos 对应媒体的详情及账号存储页面为准。单张测试结果不能保证其他文件、视频或账号获得相同结果。
 
-Original quality 只影响**之后上传的文件**，不会改变已上传的图片或视频。新目录不需要先启动批量同步：先确认相册，在全局同步关闭时先做**一张照片**的验证，并在 Google Photos 的「详情」和账号存储管理页面检查结果。
+## 离线测试
 
-**原画质单张验证（2026-11-15）**：项目本地自行编译的上传程序，在用户自行授权的账户下试传一张 12 MP（4000 × 3000）照片。用户从 Google Photos 媒体详情核实：`Backed up`、`Original quality`，并明确显示 `This item doesn't take up space in your account storage`；上传到已绑定相册。这证实了**该照片在该次测试中的实际结果**，因此本项目将**新来源的默认上传模式改为原画质**。这不意味着所有照片、视频、账户或未来备份都一定不计配额，Google 可能随时调整政策；建议检查其他文件的结果和账户空间变化。
-
-上游 gotohp 另有独立的 `--use-quota` 参数，本项目的画质开关**不启用这个参数**；因此“原画质”与“主动计入配额”不是同一个开关。最终画质和计费应以 Google Photos 显示为准。
-
-## 隐私与数据
-
-- `webui/state/`：私有 SQLite、授权配置及运行记录；已被 Git 忽略，不应提交。
-- `engine/gotohp-src/`：固定版本的 gotohp 源码及许可文件。
-- `engine/bin/`：本机编译产物，已被 Git 忽略。
-- 本项目不应收集 Google 密码、完整 Chrome Cookie 库、设备私钥，也不需要使用别人的远程上传服务器。
-- Google Photos 不是重要照片的唯一安全副本，建议保留原始文件。
-
-离线回归测试（**不会上传文件**）：
+以下测试不会上传媒体：
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-## 来源和许可
+## 来源与许可
 
-- GoogleUnlimited 上游：[shishir0x/GoogleUnlimited](https://github.com/shishir0x/GoogleUnlimited)
-- 上传引擎：[xob0t/gotohp](https://github.com/xob0t/gotohp)，固定版本见本项目 `engine/gotohp-src/`，保留原版 MIT 许可。
-- 项目开发细节与变更记录见 [docs/DEVELOPMENT_PLAN.md](docs/DEVELOPMENT_PLAN.md)。本项目与 Google 无隶属或官方合作关系。
+- 原项目来源：[shishir0x/GoogleUnlimited](https://github.com/shishir0x/GoogleUnlimited)。该上游仓库未提供 LICENSE 文件；此处仅注明来源，不将其原始代码误标为 MIT。上游代码的再分发权限应以原作者授权为准。
+- 上传引擎：[xob0t/gotohp](https://github.com/xob0t/gotohp)，固定源码提交见 `engine/gotohp-src/UPSTREAM_REVISION`；保留 MIT 许可证及版权声明：`engine/gotohp-src/LICENSE`。
+- SQLite PowerShell 模块：[RamblingCookieMonster/PSSQLite](https://github.com/RamblingCookieMonster/PSSQLite)，保留 MIT 许可证及版权声明：`Modules/PSSQLite/LICENSE`。
+- 本项目与 Google 无隶属或官方合作关系。
